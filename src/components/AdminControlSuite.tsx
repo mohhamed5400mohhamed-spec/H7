@@ -38,9 +38,11 @@ import {
   Copy,
   Palette,
   Image,
-  X
+  X,
+  Bot
 } from 'lucide-react';
 import { RoomStatsPieChart, RoomStatData } from './RoomStatsPieChart';
+import { BotAdminPanel } from './BotAdminPanel';
 import { ChatShortcut, DEFAULT_PRESET_SHORTCUTS, expandClientShortcuts } from '../utils/chatShortcuts';
 import { THEMES_LIST, FONTS_LIST, WALLPAPERS_LIST, BUBBLE_STYLES } from './ThemeAndWallpaperCenter';
 import {
@@ -277,7 +279,7 @@ interface AdminControlSuiteProps {
   onAssignMemberBanner?: (username: string, bannerUrl?: string) => void;
   onGrantMemberGift?: (username: string, giftUrl: string, giftTitle?: string) => void;
   onRemoveMemberGift?: (username: string, giftUrl: string) => void;
-  initialTab?: 'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors';
+  initialTab?: 'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors' | 'bots';
   initialThemeToEdit?: string;
   socket?: any;
   onClose: () => void;
@@ -383,8 +385,13 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
 }) => {
   // Navigation Tabs
   const [activeTab, setActiveTab] = useState<
-    'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors'
+    'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors' | 'bots'
   >(initialTab || 'moderation');
+
+  const isBotAdminOnly =
+    currentUser.role === 'hassan' ||
+    currentUser.role === 'admin' ||
+    (rolesConfig.find((r) => r.id.toLowerCase() === currentUser.role.toLowerCase())?.level || 0) >= 100;
 
   // Configurable Timeouts & Grace Periods State
   const [timeoutForm, setTimeoutForm] = useState({
@@ -1090,7 +1097,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
         </button>
       </div>
 
-      <div className="grid grid-cols-6 bg-[#1a140f] text-[9.5px] font-bold border-b border-[#3e2c1c]">
+      <div className="grid grid-cols-4 sm:grid-cols-8 bg-[#1a140f] text-[9.5px] font-bold border-b border-[#3e2c1c]">
         <button
           onClick={() => setActiveTab('shortcuts')}
           className={`py-2 px-0.5 text-center transition-colors border-b-2 flex items-center justify-center gap-1 cursor-pointer ${
@@ -1186,6 +1193,21 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
           <Palette className="w-3.5 h-3.5 text-pink-400" />
           <span>الألوان</span>
         </button>
+
+        {isBotAdminOnly && (
+          <button
+            onClick={() => setActiveTab('bots')}
+            className={`py-2 px-0.5 text-center transition-colors border-b-2 flex items-center justify-center gap-1 cursor-pointer ${
+              activeTab === 'bots'
+                ? 'border-emerald-400 text-emerald-300 bg-emerald-950/40 font-black'
+                : 'border-transparent text-slate-300 hover:text-white'
+            }`}
+            title="إدارة البوتات (للأدمن فقط)"
+          >
+            <Bot className="w-3.5 h-3.5 text-emerald-400" />
+            <span>إدارة البوتات</span>
+          </button>
+        )}
       </div>
 
       {/* TAB 1: MEMBERS MODERATION */}
@@ -7841,6 +7863,10 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {activeTab === 'bots' && isBotAdminOnly && (
+        <BotAdminPanel socket={socket} roomsList={roomsList} showToast={showToast} />
       )}
 
       {adminDialog && (

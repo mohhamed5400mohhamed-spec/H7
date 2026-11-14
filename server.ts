@@ -31,6 +31,8 @@ import {
   toPublicMediaUrl
 } from './server/utils/security.ts';
 import { registerApiRoutes } from './server/routes/apiRoutes.ts';
+import { botEngine } from './server/bots/bot.js';
+import { registerBotSocketHandlers, broadcastBotsStateToAdmins } from './server/bots/botController.js';
 
 export { sanitizeText, sanitizeUrl, hashPassword, verifyPassword };
 
@@ -3320,6 +3322,11 @@ export function hydrateAllCollectionsFromStorage(isRehydration = false) {
       chatHistory = historyData;
     }
 
+    // Rehydrate bots, settings & botReplies and reconcile active bots
+    if (botHostContext) {
+      botEngine.loadFromStorage(isRehydration);
+    }
+
     if (isRehydration) {
       console.log('🔄 [Data Layer] Re-hydrated all collections from persistent/cloud storage.');
       io.emit('rolesConfigUpdated', rolesConfig);
@@ -3339,11 +3346,37 @@ export function hydrateAllCollectionsFromStorage(isRehydration = false) {
       io.emit('monitoredWordsUpdated', monitoredWords);
       io.emit('messageRetentionLimitsUpdated', messageRetentionLimits);
       io.emit('recentLoginsUpdated', getRecentLogins());
+      if (botHostContext) {
+        broadcastBotsStateToAdmins(botHostContext);
+      }
     }
   } catch (err) {
     console.error('Error during hydrateAllCollectionsFromStorage:', err);
   }
 }
+
+const botHostContext = {
+  io,
+  dataManager,
+  users,
+  registeredMembers,
+  chatRooms,
+  chatHistory,
+  saveMembers,
+  saveHistory,
+  pruneRoomChatHistory,
+  broadcastRoomUsers,
+  broadcastAllUsers,
+  broadcastRoomsUpdate,
+  broadcastAllRegisteredMembers,
+  getCurrentTimeString,
+  sanitizeText,
+  sanitizeUrl,
+  logMonitorEvent,
+  isSupremeHassan,
+  getRoleLevel
+};
+botEngine.init(botHostContext);
 
 // Hook into DataManager hydration event whenever MongoDB / Cloud storage completes cache warmup
 dataManager.onHydrated(() => {
@@ -3446,6 +3479,8 @@ setInterval(() => {
 
 // Socket connection
 io.on('connection', (socket) => {
+  registerBotSocketHandlers(socket, botHostContext);
+
   // High-performance socket anti-flood & rate limiter middleware
   socket.use(([event], next) => {
     // Whitelist heartbeats, latency pongs, background presence, and critical system hooks
@@ -5735,6 +5770,11 @@ io.on('connection', (socket) => {
     const cleanName = sanitizeText(username?.trim());
     if (!cleanName) return;
 
+    if (botEngine.isBotUser(cleanName)) {
+      socket.emit('systemAlert', '🤖 البوتات لا يمكن حظرها نهائياً أو إضافتها لقائمة المحظورين. يستطيع الأدمن إيقاف البوت أو حذفه من [إدارة البوتات].');
+      return;
+    }
+
     // Hierarchy check: cannot ban equal or higher rank
     const targetMember = getRegisteredMember(cleanName)?.member;
     const targetLive = users.find((u) => u.username.toLowerCase() === cleanName.toLowerCase());
@@ -6523,6 +6563,14 @@ io.on('connection', (socket) => {
     broadcastAllUsers();
     broadcastAllRegisteredMembers();
 
+    // Trigger bot room welcome greeting for human member entering room
+    botEngine.handleUserEnteredRoom({
+      username: resolvedUsername,
+      room: finalTargetRoom,
+      isBot: false,
+      isGhost: newUser.isGhost
+    });
+
     // Send admin data to admin, super, or custom roles with control panel permissions / level >= 50
     const userRoleLevel = getRoleLevel(newUser.role);
     if (newUser.role === 'admin' || newUser.role === 'super' || hasPermission(newUser.role, 'canAccessControlPanel') || userRoleLevel >= 50) {
@@ -6721,6 +6769,15 @@ io.on('connection', (socket) => {
       isTyping: false,
       timestamp: Date.now()
     });
+
+    // Trigger bot auto-replies & smart understanding if message contains keywords or mentions a bot
+    if (expandedMsg) {
+      botEngine.handleRoomChatMessage({
+        senderUser: user,
+        text: expandedMsg,
+        room: user.room
+      });
+    }
   });
 
   // General Broadcast Alert (إشعار عام للغرفة من الإدارة والمشرفين)
@@ -6993,9 +7050,14 @@ io.on('connection', (socket) => {
         break;
       }
 
-      // طرد من الغرفة (Kick with 2-minute cooldown)
+      // طرد من الغرفة (Kick with 2-minute cooldown, or bot auto-rejoin handling)
       case 'kick': {
         if (target) {
+          if (botEngine.isBotUser(target)) {
+            botEngine.handleBotKicked(target, target.room, admin.username);
+            socket.emit('systemAlert', `تم طرد البوت [${target.username}] من الغرفة.`);
+            break;
+          }
           const kickReason = reason || 'مخالفة قوانين وقواعد شات حسان برو';
           logMonitorEvent('kick', `طرد ${target.username} بواسطة [${admin.role.toUpperCase()}] ${admin.username} (السبب: ${kickReason})`, admin.username, target.username);
           
@@ -7046,6 +7108,10 @@ io.on('connection', (socket) => {
       case 'ban': {
         const uName = (targetUsername || target?.username || '').trim();
         if (!uName) break;
+        if (botEngine.isBotUser(uName)) {
+          socket.emit('systemAlert', '🤖 البوتات لا يمكن حظرها نهائياً ولا تضاف لقائمة المحظورين. يستطيع الأدمن إيقاف البوت أو حذفه من [إدارة البوتات].');
+          break;
+        }
         const banReason = value || reason || 'مخالفة شروط وقوانين حسان برو';
         const regTarget = getRegisteredMember(uName)?.member;
 
@@ -7746,6 +7812,10 @@ io.on('connection', (socket) => {
       // حذف عضوية بالكامل من السيرفر (Delete Account - Admin Only)
       case 'deleteAccount': {
         const uName = (targetUsername || target?.username || '').trim();
+        if (botEngine.isBotUser(uName)) {
+          socket.emit('systemAlert', '🤖 لحذف هذا البوت يرجى استخدام زر الحذف داخل لوحة [إدارة البوتات] للأدمن.');
+          break;
+        }
         const regFound = getRegisteredMember(uName);
         if (regFound) {
           delete registeredMembers[regFound.key];
@@ -9633,6 +9703,7 @@ setInterval(() => {
   const guestUserExpiryAgo = now - Math.max(600, graceSeconds) * 1000;
   for (let i = users.length - 1; i >= 0; i--) {
     const u = users[i];
+    if ((u as any).isBot) continue;
     const isSocketAlive = io.sockets.sockets.get(u.id)?.connected;
     const lastActive = u.lastActiveTime || u.joinedAt || 0;
     const cutoff = u.role === 'guest' ? guestUserExpiryAgo : memberUserExpiryAgo;

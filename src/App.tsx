@@ -770,7 +770,7 @@ export default function App() {
     activeDrawerRef.current = activeDrawer;
   }, [activeDrawer]);
   const [adminInitialTab, setAdminInitialTab] = useState<
-    'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors'
+    'moderation' | 'roomControls' | 'security' | 'bans' | 'broadcast' | 'stats' | 'memos' | 'words' | 'shortcuts' | 'logs' | 'matrix' | 'welcome' | 'emblems' | 'colors' | 'bots'
   >('moderation');
   const [adminInitialThemeToEdit, setAdminInitialThemeToEdit] = useState<string | undefined>(undefined);
 

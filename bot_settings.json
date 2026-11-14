@@ -1,0 +1,10 @@
+{
+  "botsEnabled": true,
+  "autoRoamEnabled": false,
+  "autoRejoinOnKick": true,
+  "autoRejoinDelaySeconds": 10,
+  "autoRepliesEnabled": true,
+  "welcomeEnabled": true,
+  "replyDelayEnabled": true,
+  "replyDelaySeconds": 2
+}

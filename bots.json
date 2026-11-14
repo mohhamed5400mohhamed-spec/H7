@@ -1,0 +1,20 @@
+[
+  {
+    "id": "bot_1794677116207_3m3l",
+    "name": "سارة",
+    "avatarUrl": "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2248%22%20fill%3D%22%23e11d48%22%2F%3E%3C%2Fsvg%3E",
+    "status": "busy",
+    "statusQuote": "أهلاً بكم في شات حسن برو",
+    "defaultRoom": "الغرفة العامة",
+    "currentRoom": "الغرفة العامة",
+    "personality": "friendly",
+    "notes": "بوت تجريبي",
+    "flag": "🇸🇦",
+    "enabled": true,
+    "roamMode": "random",
+    "roamRooms": [],
+    "roamIntervalMinutes": 5,
+    "createdAt": 1794677116207,
+    "updatedAt": 1794677143936
+  }
+]
