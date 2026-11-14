@@ -15,15 +15,8 @@ export default defineConfig(() => {
     },
     server: {
       host: '0.0.0.0',
-      port: 3000,
-      strictPort: true,
       // HMR options configured cleanly to prevent developer websocket connection errors during preview
-      hmr: isHmrDisabled
-        ? false
-        : {
-            clientPort: process.env.APP_URL?.startsWith('https') ? 443 : undefined,
-            protocol: process.env.APP_URL?.startsWith('https') ? 'wss' : 'ws',
-          },
+      hmr: isHmrDisabled ? false : undefined,
       watch: isHmrDisabled ? null : {},
     },
     build: {

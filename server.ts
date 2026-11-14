@@ -1,10 +1,10 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import bcrypt from 'bcryptjs';
 import { dataManager } from './server/data/dataAdapter.ts';
 import { storageManager } from './server/storage/storageAdapter.ts';
 import {
@@ -20,6 +20,19 @@ import type {
 } from './src/utils/emblemsSystem.ts';
 import { extractYouTubeVideoId } from './src/utils/youtube.ts';
 import { socketFloodGuard } from './server/security/floodGuard.ts';
+import {
+  sanitizeText,
+  sanitizeUrl,
+  hashPassword,
+  verifyPassword,
+  isBcryptHash,
+  createSignedSessionToken,
+  verifySignedSessionToken,
+  toPublicMediaUrl
+} from './server/utils/security.ts';
+import { registerApiRoutes } from './server/routes/apiRoutes.ts';
+
+export { sanitizeText, sanitizeUrl, hashPassword, verifyPassword };
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -96,15 +109,19 @@ const io = new SocketIOServer(httpServer, {
     credentials: true
   },
   maxHttpBufferSize: 50 * 1024 * 1024, // 50MB buffer
-  pingTimeout: 120000, // 120s high-tolerance timeout for mobile OS background sleep
-  pingInterval: 10000, // 10s heartbeat to prevent mobile carrier NAT / reverse proxy drops
+  pingTimeout: 180000, // 180s high-tolerance timeout for mobile OS background sleep
+  pingInterval: 15000, // 15s heartbeat to keep mobile carrier NAT / reverse proxies open
   connectTimeout: 45000,
   upgradeTimeout: 30000,
   allowUpgrades: true,
   perMessageDeflate: false, // Low latency and minimal CPU overhead for high concurrency
   httpCompression: true,
   allowEIO3: true,
-  transports: ['websocket', 'polling']
+  transports: ['websocket', 'polling'],
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 10 * 60 * 1000, // 10 minutes seamless state & room recovery
+    skipMiddlewares: true
+  }
 });
 
 app.use(express.json({ limit: '10mb' }));
@@ -130,161 +147,6 @@ app.use(
   })
 );
 
-function toPublicMediaUrl(url: string, req?: express.Request): string {
-  if (!url) return url;
-  if (url.includes('localhost:3000') || url.includes('127.0.0.1:3000')) {
-    url = url.replace(/^https?:\/\/(localhost|127\.0\.0\.1):3000/i, '');
-  }
-  if (/^https?:\/\//i.test(url)) return url;
-  const configuredOrigin = process.env.PUBLIC_SERVER_URL || process.env.SERVER_PUBLIC_URL || process.env.STORAGE_PUBLIC_URL_PREFIX;
-  if (configuredOrigin) {
-    const origin = configuredOrigin.replace(/\/$/, '');
-    return `${origin}${url.startsWith('/') ? url : `/${url}`}`;
-  }
-  return url.startsWith('/') ? url : `/${url}`;
-}
-
-// Ultra-lightweight keepalive endpoint for background Web Worker to keep mobile TCP radio alive
-app.get('/api/keepalive', (_req, res) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.setHeader('Connection', 'keep-alive');
-  res.status(200).json({ ok: true, ts: Date.now() });
-});
-
-// Storage & Database Health / Status Endpoint
-app.get('/api/system/storage-status', (_req, res) => {
-  res.json({
-    success: true,
-    data: dataManager.getStatus(),
-    storage: {
-      provider: storageManager.getProviderName(),
-      isExternal: storageManager.isExternal(),
-      endpoint: storageManager.getConfig().endpoint || 'local filesystem',
-      bucket: storageManager.getConfig().bucket || 'uploads'
-    }
-  });
-});
-
-// YouTube Search API Endpoint (البحث المباشر في يوتيوب عبر واجهة InnerTube الرسمية بدون أخطاء الترويسات)
-app.get('/api/youtube-search', async (req, res) => {
-  const query = (req.query.q as string)?.trim();
-  if (!query) {
-    return res.status(400).json({ success: false, results: [], error: 'يرجى إدخال كلمة البحث' });
-  }
-
-  try {
-    // Primary Engine: YouTube InnerTube API (JSON-only, no cookie header overflow, high speed)
-    const ytResponse = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: 'WEB',
-            clientVersion: '2.20240201.00.00',
-            hl: 'ar',
-            gl: 'SA'
-          }
-        },
-        query
-      })
-    });
-
-    if (ytResponse.ok) {
-      const data = (await ytResponse.json()) as any;
-      const sections = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
-      const formatted: Array<{
-        id: string;
-        title: string;
-        thumbnail: string;
-        duration: string;
-        channelTitle: string;
-        views: string;
-        uploadedAt: string;
-        url: string;
-      }> = [];
-
-      for (const sec of sections) {
-        const items = sec.itemSectionRenderer?.contents || [];
-        for (const item of items) {
-          if (item.videoRenderer) {
-            const v = item.videoRenderer;
-            const videoId = v.videoId;
-            if (videoId && typeof videoId === 'string') {
-              const title =
-                v.title?.runs?.map((r: any) => r.text).join('') ||
-                v.title?.simpleText ||
-                query;
-              const thumbnail =
-                v.thumbnail?.thumbnails?.slice(-1)[0]?.url ||
-                `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-              const duration = v.lengthText?.simpleText || '';
-              const channelTitle =
-                v.ownerText?.runs?.map((r: any) => r.text).join('') ||
-                'قناة يوتيوب';
-              const views =
-                v.viewCountText?.simpleText ||
-                (v.viewCountText?.runs ? v.viewCountText.runs.map((r: any) => r.text).join('') : '');
-              const uploadedAt = v.publishedTimeText?.simpleText || '';
-
-              formatted.push({
-                id: videoId,
-                title,
-                thumbnail,
-                duration,
-                channelTitle,
-                views,
-                uploadedAt,
-                url: `https://www.youtube.com/watch?v=${videoId}`
-              });
-            }
-          }
-        }
-      }
-
-      if (formatted.length > 0) {
-        return res.json({ success: true, results: formatted.slice(0, 25) });
-      }
-    }
-
-    // Fallback Engine: Invidious public mirror
-    const invidiousRes = await fetch(`https://inv.tux.pizza/api/v1/search?q=${encodeURIComponent(query)}&type=video`, {
-      headers: { 'Accept': 'application/json' }
-    });
-    if (invidiousRes.ok) {
-      const invData = (await invidiousRes.json()) as any[];
-      if (Array.isArray(invData) && invData.length > 0) {
-        const invResults = invData.slice(0, 20).map((v) => ({
-          id: v.videoId || '',
-          title: v.title || query,
-          thumbnail: v.videoThumbnails?.[0]?.url || `https://img.youtube.com/vi/${v.videoId}/hqdefault.jpg`,
-          duration: v.lengthSeconds ? `${Math.floor(v.lengthSeconds / 60)}:${String(v.lengthSeconds % 60).padStart(2, '0')}` : '',
-          channelTitle: v.author || 'قناة يوتيوب',
-          views: v.viewCount ? `${v.viewCount.toLocaleString()} مشاهدة` : '',
-          uploadedAt: v.publishedText || '',
-          url: `https://www.youtube.com/watch?v=${v.videoId}`
-        })).filter(v => Boolean(v.id));
-
-        if (invResults.length > 0) {
-          return res.json({ success: true, results: invResults });
-        }
-      }
-    }
-
-    return res.json({ success: true, results: [] });
-  } catch (err: any) {
-    console.error('[YouTube Search] Search error handled safely:', err?.message);
-    return res.json({
-      success: true,
-      results: [],
-      warning: 'تعذر الاتصال بخدمة البحث مؤقتاً، يمكنك لصق رابط الفيديو مباشرة في الحائط.'
-    });
-  }
-});
-
 function extractUploadSessionToken(req: express.Request): string {
   const headerToken = (req.headers['x-session-token'] as string) || '';
   const authHeader = (req.headers['authorization'] as string) || '';
@@ -295,81 +157,39 @@ function extractUploadSessionToken(req: express.Request): string {
 function isUploadAuthorized(req: express.Request): boolean {
   const token = extractUploadSessionToken(req);
   if (!token) return false;
+  if (token.startsWith('st_') && !verifySignedSessionToken(token)) {
+    return false;
+  }
   const sess = activeSessions.get(token);
   return Boolean(sess && !sess.isExplicitlyLoggedOut);
 }
 
-// HTTP Media Upload Endpoint: Bypasses WebSocket frames to prevent socket freeze/disconnect
-app.post('/api/upload-media-binary', async (req, res) => {
-  try {
-    if (!isUploadAuthorized(req)) {
-      return res.status(401).json({ success: false, error: 'يجب تسجيل الدخول أولاً لرفع الملفات.' });
-    }
-    const rawFilename = req.headers['x-filename'] ? decodeURIComponent(req.headers['x-filename'] as string) : 'file';
-    const mime = (req.headers['content-type'] || '').toLowerCase();
-    if (mime.includes('svg') || /\.svg$/i.test(rawFilename)) {
-      return res.status(400).json({ success: false, error: 'صيغة SVG غير مسموح برفعها لأسباب أمنية.' });
-    }
-
-    const uploadResult = await storageManager.saveStream(req, rawFilename, mime);
-
-    return res.json({
-      success: uploadResult.success,
-      url: toPublicMediaUrl(uploadResult.url, req),
-      mediaType: uploadResult.mediaType,
-      size: uploadResult.size,
-      filename: uploadResult.filename,
-      provider: uploadResult.provider
-    });
-  } catch (err: any) {
-    console.error('Error in binary upload:', err);
-    return res.status(500).json({ success: false, error: err?.message || 'فشل حفظ الملف على الخادم أو التخزين السحابي' });
-  }
-});
-
-app.post('/api/upload-media', async (req, res) => {
-  try {
-    if (!isUploadAuthorized(req)) {
-      return res.status(401).json({ success: false, error: 'يجب تسجيل الدخول أولاً لرفع الملفات.' });
-    }
-    const { dataUrl, filename, mediaType } = req.body;
-    if (!dataUrl || typeof dataUrl !== 'string') {
-      return res.status(400).json({ success: false, error: 'بيانات الملف مفقودة' });
-    }
-
-    const matches = dataUrl.match(/^data:([A-Za-z0-9-+\/]+);base64,(.+)$/);
-    let buffer: Buffer;
-    let mime = '';
-
-    if (matches && matches.length === 3) {
-      mime = matches[1].toLowerCase();
-      buffer = Buffer.from(matches[2], 'base64');
-    } else {
-      buffer = Buffer.from(dataUrl, 'base64');
-    }
-
-    const originalFilename = filename || `file_${Date.now()}`;
-    if (mime.includes('svg') || /\.svg$/i.test(originalFilename)) {
-      return res.status(400).json({ success: false, error: 'صيغة SVG غير مسموح برفعها لأسباب أمنية.' });
-    }
-    if (buffer.length > 25 * 1024 * 1024) {
-      return res.status(413).json({ success: false, error: 'حجم الملف يتجاوز 25 ميجابايت.' });
-    }
-
-    const uploadResult = await storageManager.saveBuffer(buffer, originalFilename, mime);
-
-    return res.json({
-      success: uploadResult.success,
-      url: toPublicMediaUrl(uploadResult.url, req),
-      mediaType: mediaType || uploadResult.mediaType,
-      size: uploadResult.size,
-      filename: uploadResult.filename,
-      provider: uploadResult.provider
-    });
-  } catch (err: any) {
-    console.error('Error saving uploaded media:', err);
-    return res.status(500).json({ success: false, error: 'فشل حفظ الملف على الخادم أو التخزين السحابي' });
-  }
+registerApiRoutes(app, {
+  isUploadAuthorized,
+  getInitialAppearancePayload: () => {
+    const banner = globalAppearance.bannerUrl || emblemsConfig.falconChatBanner || DEFAULT_FALCON_CHAT_BANNER;
+    const logo = globalAppearance.logoUrl || emblemsConfig.falconAvatarIcon || DEFAULT_FALCON_AVATAR_ICON;
+    return {
+      success: true,
+      bannerUrl: banner,
+      logoUrl: logo,
+      theme: globalAppearance.theme || 'pearl-gray-calm',
+      fontFamily: globalAppearance.fontFamily || 'Cairo',
+      fontWeight: globalAppearance.fontWeight || 'default',
+      wallpaper: globalAppearance.wallpaper || 'default',
+      bubbleStyle: globalAppearance.bubbleStyle || 'modern',
+      generalWelcome: generalWelcomeSettings,
+      marqueeTicker: serverSecurity.marqueeTicker,
+      rolesConfig: rolesConfig,
+      rolePermissions: rolePermissions,
+      likesSettings: likesSettings
+    };
+  },
+  getStatsPayload: () => ({
+    onlineUsers: users.length,
+    activeRooms: chatRooms.length,
+    totalMessages: chatHistory.length
+  })
 });
 
 /**
@@ -417,57 +237,7 @@ export async function ensureMediaUrlNotBase64(url: string | undefined): Promise<
   }
 }
 
-// XSS Sanitizer helper
-function sanitizeText(str?: string | null): string {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-    .trim();
-}
-
-/**
- * URL Sanitizer to prevent malicious URI execution (javascript:, vbscript:, data:text/html)
- */
-export function sanitizeUrl(url?: string | null): string {
-  if (!url || typeof url !== 'string') return '';
-  const trimmed = url.trim();
-  if (/^(javascript|vbscript|data:\s*text\/html)/i.test(trimmed)) {
-    return '';
-  }
-  return trimmed;
-}
-
-/**
- * Robust Password Hashing and Verification using bcrypt (10 salt rounds)
- * With zero-downtime backwards compatibility and automated migration for legacy plain text passwords.
- */
-export function hashPassword(plainPassword: string): string {
-  if (!plainPassword) return '';
-  // Avoid re-hashing if already a bcrypt hash
-  if (plainPassword.startsWith('$2a$') || plainPassword.startsWith('$2b$')) {
-    return plainPassword;
-  }
-  const salt = bcrypt.genSaltSync(10);
-  return bcrypt.hashSync(plainPassword, salt);
-}
-
-export function verifyPassword(plainPassword: string, storedHashOrPlain: string): boolean {
-  if (!plainPassword || !storedHashOrPlain) return false;
-  // If stored credential is a standard bcrypt hash
-  if (storedHashOrPlain.startsWith('$2a$') || storedHashOrPlain.startsWith('$2b$')) {
-    try {
-      return bcrypt.compareSync(plainPassword, storedHashOrPlain);
-    } catch {
-      return false;
-    }
-  }
-  // Graceful fallback for legacy passwords (e.g. initial '123')
-  return plainPassword === storedHashOrPlain;
-}
+// Security helpers (sanitizeText, sanitizeUrl, hashPassword, verifyPassword) are imported from ./server/utils/security.ts
 
 export interface StoredMessage {
   id: string;
@@ -2224,27 +1994,7 @@ export function loadGlobalAppearance() {
   }
 }
 
-// Ultra-Fast Initial Appearance Endpoint: Delivers approved banner, logo, wallpaper and theme instantly on page boot
-app.get('/api/initial-appearance', (_req, res) => {
-  res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=60');
-  const banner = globalAppearance.bannerUrl || emblemsConfig.falconChatBanner || DEFAULT_FALCON_CHAT_BANNER;
-  const logo = globalAppearance.logoUrl || emblemsConfig.falconAvatarIcon || DEFAULT_FALCON_AVATAR_ICON;
-  res.json({
-    success: true,
-    bannerUrl: banner,
-    logoUrl: logo,
-    theme: globalAppearance.theme || 'dark-gold',
-    fontFamily: globalAppearance.fontFamily || 'Cairo',
-    fontWeight: globalAppearance.fontWeight || 'default',
-    wallpaper: globalAppearance.wallpaper || 'default',
-    bubbleStyle: globalAppearance.bubbleStyle || 'modern',
-    generalWelcome: generalWelcomeSettings,
-    marqueeTicker: serverSecurity.marqueeTicker,
-    rolesConfig: rolesConfig,
-    rolePermissions: rolePermissions,
-    likesSettings: likesSettings
-  });
-});
+// Initial appearance endpoint is registered via ./server/routes/apiRoutes.ts
 
 // Save / Load Functions
 export function saveMonitoredWords() {
@@ -2330,15 +2080,15 @@ export function loadStaffMemos() {
   }
 }
 
-// Rooms list (Matching Screenshot 3 + Jail Room)
+// Rooms list (Passwords pre-hashed with bcrypt)
 let chatRooms: ChatRoom[] = [
   { id: 'الغرفة العامة', name: 'الغرفة العامة Room (الرئيسية)', desc: 'ملتقى جميع الأعضاء والزوار', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 0 },
   { id: 'السعودية', name: 'Room | السعودية', desc: 'فديتك ياااا السعودية 🇸🇦', isPasswordProtected: false, voiceLimit: 33, activeVoiceCount: 0 },
   { id: 'العراق', name: 'Room | العراق', desc: 'حياكم روم العراق 🇮🇶', isPasswordProtected: false, voiceLimit: 20, activeVoiceCount: 0 },
   { id: 'المسابقات', name: 'Room | المسابقات', desc: 'اكتب مسابقات وابدأ اللعب 🎯🔥', isPasswordProtected: false, voiceLimit: 40, activeVoiceCount: 0 },
-  { id: 'خاص vip', name: 'غرفة VIP خاصة 🔒', desc: 'غرفة خاصة لكبار الشخصيات', isPasswordProtected: true, password: 'vip', voiceLimit: 10, activeVoiceCount: 0 },
+  { id: 'خاص vip', name: 'غرفة VIP خاصة 🔒', desc: 'غرفة خاصة لكبار الشخصيات', isPasswordProtected: true, password: hashPassword('vip'), voiceLimit: 10, activeVoiceCount: 0 },
   { id: 'صوت حسان برو', name: 'مجلس الصوت المباشر 🎙️', desc: 'صوت جماعي عالي النقاء', isPasswordProtected: false, voiceLimit: 30, activeVoiceCount: 0 },
-  { id: 'سجن حسان برو', name: '🚔 سجن واحتجاز حسان برو', desc: 'غرفة توقيف المخالفين بقرار إداري صارم', isPasswordProtected: true, password: 'jail', voiceLimit: 50, activeVoiceCount: 0 }
+  { id: 'سجن حسان برو', name: '🚔 سجن واحتجاز حسان برو', desc: 'غرفة توقيف المخالفين بقرار إداري صارم', isPasswordProtected: true, password: hashPassword('jail'), voiceLimit: 50, activeVoiceCount: 0 }
 ];
 
 export function saveChatRooms() {
@@ -2353,7 +2103,17 @@ export function loadChatRooms() {
   try {
     const parsed = dataManager.loadChatRoomsSync<ChatRoom[]>(chatRooms);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      chatRooms = parsed;
+      let upgraded = false;
+      chatRooms = parsed.map((room) => {
+        if (room.isPasswordProtected && room.password && !isBcryptHash(room.password)) {
+          upgraded = true;
+          return { ...room, password: hashPassword(room.password) };
+        }
+        return room;
+      });
+      if (upgraded) {
+        saveChatRooms();
+      }
     }
   } catch (err) {
     console.error('Error loading chat rooms:', err);
@@ -2771,8 +2531,10 @@ export function broadcastRoomUsers(room: string) {
   }
 }
 
-// Broadcast global presence snapshot with Ghost login privacy filtering
-export function broadcastAllUsers() {
+// Broadcast global presence snapshot with Ghost login privacy filtering (debounced 150ms to coalesce rapid bursts)
+let broadcastAllUsersTimer: NodeJS.Timeout | null = null;
+
+function executeBroadcastAllUsers() {
   const allPresence = getPresenceSnapshot();
   for (const [socketId, s] of io.sockets.sockets.entries()) {
     const recipient = users.find((u) => u.id === socketId);
@@ -2790,6 +2552,23 @@ export function broadcastAllUsers() {
       s.emit('allRegisteredMembers', getAllRegisteredMembersPayload(viewerLevel, socketId, recipient.role));
     }
   }
+}
+
+export function broadcastAllUsers(immediate = false) {
+  if (immediate) {
+    if (broadcastAllUsersTimer) {
+      clearTimeout(broadcastAllUsersTimer);
+      broadcastAllUsersTimer = null;
+    }
+    executeBroadcastAllUsers();
+    return;
+  }
+  if (broadcastAllUsersTimer) return;
+  broadcastAllUsersTimer = setTimeout(() => {
+    broadcastAllUsersTimer = null;
+    executeBroadcastAllUsers();
+  }, 150);
+  broadcastAllUsersTimer.unref?.();
 }
 
 // IP Address & Device Fingerprint to accounts / nicknames mapping (كشف النكات والآي بي وبصمة الجهاز)
@@ -3694,42 +3473,68 @@ io.on('connection', (socket) => {
   const cfCountry = (socket.handshake.headers['cf-ipcountry'] as string) || '';
   const detectedRealFlag = getFlagFromCountryCode(cfCountry);
 
-  const onlineUsersSnapshot = getPresenceSnapshot().filter((u) => u.presenceState !== 'offline' && !u.isGhost);
-  const currentConnectedCount = onlineUsersSnapshot.length;
-  io.emit('onlineCountUpdated', currentConnectedCount);
-
-  // Send initial configuration payload with currently connected users and recent logins
-  socket.emit('initialRoster', {
-    onlineCount: currentConnectedCount,
-    users: onlineUsersSnapshot,
-    rooms: getChatRoomsWithLiveCounts(),
-    roomStats: getRoomStatistics(),
-    shortcuts: chatShortcuts,
-    likesSettings,
-    marqueeTicker: serverSecurity.marqueeTicker,
-    globalAppearance,
-    generalWelcome: generalWelcomeSettings,
-    emblemsConfig,
-    rolesConfig,
-    rolePermissions,
-    stories: getActiveStories(),
-    wallPosts: wallPosts.slice(0, 50),
-    recentLogins: getRecentLogins(),
-    serverSecurity: {
-      marqueeTicker: serverSecurity.marqueeTicker,
-      guestsAllowed: serverSecurity.guestsAllowed,
-      emergencyLockdown: serverSecurity.emergencyLockdown,
-      blockExternalLinks: serverSecurity.blockExternalLinks
+  if (socket.recovered) {
+    const recoveredUser = users.find((u) => u.id === socket.id);
+    if (recoveredUser) {
+      const lowerName = recoveredUser.username.toLowerCase();
+      if (pendingAwayTimers.has(lowerName)) {
+        clearTimeout(pendingAwayTimers.get(lowerName)!);
+        pendingAwayTimers.delete(lowerName);
+      }
+      recoveredUser.lastActiveTime = Date.now();
+      if (recoveredUser.presenceState === 'offline') {
+        recoveredUser.presenceState = 'online';
+        io.emit('userPresenceUpdated', {
+          userId: recoveredUser.id,
+          username: recoveredUser.username,
+          state: 'online'
+        });
+        broadcastRoomUsers(recoveredUser.room);
+        broadcastAllUsers();
+      }
+      if (recoveredUser.sessionToken && activeSessions.has(recoveredUser.sessionToken)) {
+        const sess = activeSessions.get(recoveredUser.sessionToken)!;
+        sess.lastActiveTime = Date.now();
+      }
     }
-  });
+  } else {
+    const onlineUsersSnapshot = getPresenceSnapshot().filter((u) => u.presenceState !== 'offline' && !u.isGhost);
+    const currentConnectedCount = onlineUsersSnapshot.length;
+    io.emit('onlineCountUpdated', currentConnectedCount);
 
-  socket.emit('rolesConfigUpdated', rolesConfig);
-  socket.emit('rolePermissionsUpdated', rolePermissions);
-  socket.emit('allUsers', getPresenceSnapshot().filter((u) => !u.isGhost));
-  socket.emit('allRegisteredMembers', []);
+    // Send initial configuration payload with currently connected users and recent logins
+    socket.emit('initialRoster', {
+      onlineCount: currentConnectedCount,
+      users: onlineUsersSnapshot,
+      rooms: getChatRoomsWithLiveCounts(),
+      roomStats: getRoomStatistics(),
+      shortcuts: chatShortcuts,
+      likesSettings,
+      marqueeTicker: serverSecurity.marqueeTicker,
+      globalAppearance,
+      generalWelcome: generalWelcomeSettings,
+      emblemsConfig,
+      rolesConfig,
+      rolePermissions,
+      stories: getActiveStories(),
+      wallPosts: wallPosts.slice(0, 50),
+      recentLogins: getRecentLogins(),
+      serverSecurity: {
+        marqueeTicker: serverSecurity.marqueeTicker,
+        guestsAllowed: serverSecurity.guestsAllowed,
+        emergencyLockdown: serverSecurity.emergencyLockdown,
+        blockExternalLinks: serverSecurity.blockExternalLinks
+      }
+    });
 
-  socket.emit('recentLoginsUpdated', getRecentLogins());
-  socket.emit('messageRetentionLimitsUpdated', messageRetentionLimits);
+    socket.emit('rolesConfigUpdated', rolesConfig);
+    socket.emit('rolePermissionsUpdated', rolePermissions);
+    socket.emit('allUsers', getPresenceSnapshot().filter((u) => !u.isGhost));
+    socket.emit('allRegisteredMembers', []);
+
+    socket.emit('recentLoginsUpdated', getRecentLogins());
+    socket.emit('messageRetentionLimitsUpdated', messageRetentionLimits);
+  }
 
   socket.on('getRecentLogins', () => {
     socket.emit('recentLoginsUpdated', getRecentLogins());
@@ -5007,7 +4812,7 @@ io.on('connection', (socket) => {
       if (regRes) {
         const foundKey = regRes.key;
         const member = regRes.member;
-        const restoredToken = sessionToken || `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        const restoredToken = sessionToken || createSignedSessionToken();
         const restoredUser: ConnectedUser = {
           id: socket.id,
           username: foundKey,
@@ -5285,7 +5090,11 @@ io.on('connection', (socket) => {
         });
       }
 
-      io.emit('userPresenceUpdated', { userId: socket.id, username: session.user.username, state: 'online' });
+      io.emit('userPresenceUpdated', {
+        userId: socket.id,
+        username: session.user.username,
+        state: session.user.presenceState || 'online'
+      });
       broadcastRoomUsers(targetRoom);
       broadcastAllUsers();
       socket.emit('micSlotsUpdated', getMicSlotsForRoom(targetRoom));
@@ -5662,25 +5471,25 @@ io.on('connection', (socket) => {
   });
 
   // Verify room password server-side without ever sending passwords to clients
-  socket.on('verifyRoomPassword', ({ roomId, password }: { roomId: string; password?: string }, callback?: (res: { ok: boolean; error?: string }) => void) => {
+  socket.on('verifyRoomPassword', ({ roomId, password }: { roomId: string; password?: string }, callback?: (res: { ok: boolean; valid?: boolean; error?: string }) => void) => {
     const actor = users.find((u) => u.id === socket.id);
     const roomObj = chatRooms.find((r) => r.id === roomId);
     if (!roomObj) {
-      callback?.({ ok: false, error: 'الغرفة غير موجودة.' });
+      callback?.({ ok: false, valid: false, error: 'الغرفة غير موجودة.' });
       return;
     }
     if (!roomObj.isPasswordProtected || !roomObj.password) {
-      callback?.({ ok: true });
+      callback?.({ ok: true, valid: true });
       return;
     }
     if (actor && (isSupremeHassan(actor) || actor.role === 'admin' || getRoleLevel(actor.role) >= getRoleLevel('admin'))) {
-      callback?.({ ok: true });
+      callback?.({ ok: true, valid: true });
       return;
     }
-    if ((password || '').trim() === roomObj.password) {
-      callback?.({ ok: true });
+    if (verifyPassword((password || '').trim(), roomObj.password)) {
+      callback?.({ ok: true, valid: true });
     } else {
-      callback?.({ ok: false, error: 'كلمة المرور غير صحيحة، يرجى إعادة المحاولة' });
+      callback?.({ ok: false, valid: false, error: 'كلمة المرور غير صحيحة، يرجى إعادة المحاولة' });
     }
   });
 
@@ -5846,7 +5655,7 @@ io.on('connection', (socket) => {
       } else if (data.isPasswordProtected === true || (data.password && data.password.trim())) {
         if (data.password && data.password.trim()) {
           room.isPasswordProtected = true;
-          room.password = sanitizeText(data.password.trim());
+          room.password = hashPassword(data.password.trim());
         }
       }
       saveChatRooms();
@@ -5872,8 +5681,13 @@ io.on('connection', (socket) => {
     socket.emit('systemAlert', `تم حفظ وتحديث إعدادات غرفة [${data.roomId}] بنجاح ⚙️`);
   });
 
-  // Get Staff Memos
+  // Get Staff Memos (Staff Only)
   socket.on('getStaffMemos', () => {
+    const actor = users.find((u) => u.id === socket.id);
+    if (!actor || (!isSupremeHassan(actor) && actor.role !== 'admin' && actor.role !== 'super' && !hasPermission(actor.role, 'canAccessControlPanel') && getRoleLevel(actor.role) < 50)) {
+      socket.emit('staffMemosUpdated', []);
+      return;
+    }
     socket.emit('staffMemosUpdated', staffMemos);
   });
 
@@ -6372,7 +6186,7 @@ io.on('connection', (socket) => {
       const isRoomAdminBypass = isSupremeHassan(resolvedPreRole) || resolvedPreRole === 'admin' || getRoleLevel(resolvedPreRole) >= getRoleLevel('admin');
       const isJailAutoPlacement = finalTargetRoom === 'سجن حسان برو' && isUserJailed;
       if (!isAlreadyInTargetRoom && !isRoomAdminBypass && !isJailAutoPlacement) {
-        if ((roomPassword || '').trim() !== targetRoomDef.password) {
+        if (!verifyPassword((roomPassword || '').trim(), targetRoomDef.password)) {
           socket.emit('systemAlert', `🔒 كلمة المرور غير صحيحة لدخول غرفة [${targetRoomDef.name}].`);
           return;
         }
@@ -6497,7 +6311,7 @@ io.on('connection', (socket) => {
       userQuote = getDefaultStatusByRole(userRole);
     }
 
-    const userSessionToken = `token_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const userSessionToken = createSignedSessionToken();
 
     const canGhost = Boolean(rolePermissions[userRole]?.canGhostLogin);
     const effectiveGhost = isGhost !== undefined ? Boolean(isGhost) : previousIsGhost;
@@ -7565,15 +7379,17 @@ io.on('connection', (socket) => {
       case 'setRoomPassword': {
         const room = chatRooms.find((r) => r.id === admin.room);
         if (room) {
-          const pass = sanitizeText(value);
+          const pass = typeof value === 'string' ? value.trim() : '';
           if (pass) {
             room.isPasswordProtected = true;
-            room.password = pass;
+            room.password = hashPassword(pass);
+            saveChatRooms();
             broadcastRoomsUpdate();
-            socket.emit('systemAlert', `تم تعيين كلمة مرور للغرفة [${room.name}]: ${pass}`);
+            socket.emit('systemAlert', `تم تعيين وحماية كلمة مرور الغرفة [${room.name}] بنجاح 🔒`);
           } else {
             room.isPasswordProtected = false;
             delete room.password;
+            saveChatRooms();
             broadcastRoomsUpdate();
             socket.emit('systemAlert', `تمت إزالة كلمة المرور وأصبحت الغرفة [${room.name}] عامة ومفتوحة.`);
           }
@@ -8052,9 +7868,9 @@ io.on('connection', (socket) => {
             if (desc !== undefined) room.desc = sanitizeText(desc);
             if (voiceLimit) room.voiceLimit = Number(voiceLimit) || room.voiceLimit;
             if (password !== undefined) {
-              if (password) {
+              if (typeof password === 'string' && password.trim()) {
                 room.isPasswordProtected = true;
-                room.password = sanitizeText(password);
+                room.password = hashPassword(password.trim());
               } else {
                 room.isPasswordProtected = false;
                 delete room.password;
@@ -9345,12 +9161,13 @@ io.on('connection', (socket) => {
     const cleanName = sanitizeText(name);
     if (!cleanName) return;
 
+    const cleanPass = typeof password === 'string' ? password.trim() : '';
     const newRoom: ChatRoom = {
       id: cleanName,
       name: `Room | ${cleanName}`,
       desc: sanitizeText(desc) || 'غرفة جديدة في حسان برو',
-      isPasswordProtected: !!password,
-      password: password || undefined,
+      isPasswordProtected: Boolean(cleanPass),
+      password: cleanPass ? hashPassword(cleanPass) : undefined,
       voiceLimit: 30,
       activeVoiceCount: 0
     };
@@ -9622,9 +9439,19 @@ io.on('connection', (socket) => {
     io.to(targetId).emit('liveSignal', { senderId: socket.id, senderUsername: sender?.username || 'المستخدم', signal });
   });
 
+  let lastLiveFrameAt = 0;
+
   socket.on('liveVideoFrame', ({ room, frameData }: { room: string; frameData: string }) => {
     const sender = users.find((u) => u.id === socket.id);
     if (!sender) return;
+    const broadcast = activeLiveBroadcasts.get(room);
+    if (!broadcast || broadcast.broadcasterId !== socket.id) return;
+    if (typeof frameData !== 'string' || !frameData.startsWith('data:image/') || frameData.length > 180_000) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastLiveFrameAt < 100) return;
+    lastLiveFrameAt = now;
     socket.to(room).emit('liveVideoFrame', { broadcasterUsername: sender.username, frameData });
   });
 
@@ -9772,14 +9599,19 @@ io.on('connection', (socket) => {
   });
 });
 
-// Periodic check: Removes sessions only after the 1-hour grace period has fully expired
+// Periodic check: Removes expired sessions (shorter TTL for guests, generous TTL for registered members)
 setInterval(() => {
-  const oneHourAgo = Date.now() - 3600 * 1000;
+  const graceSeconds = Number(serverSecurity.offlineGraceSeconds ?? 300);
+  const now = Date.now();
+  const memberSessionExpiryAgo = now - Math.max(3600, graceSeconds * 2) * 1000;
+  const guestSessionExpiryAgo = now - Math.max(900, graceSeconds * 2) * 1000;
   let changed = false;
 
   for (const [token, session] of activeSessions.entries()) {
     const socketConnected = io.sockets.sockets.get(session.currentSocketId)?.connected;
-    if (!socketConnected && session.lastActiveTime < oneHourAgo) {
+    const isGuest = session.user?.role === 'guest';
+    const expiryCutoff = isGuest ? guestSessionExpiryAgo : memberSessionExpiryAgo;
+    if (!socketConnected && session.lastActiveTime < expiryCutoff) {
       const uIdx = users.findIndex((u) => u.username.toLowerCase() === session.user.username.toLowerCase());
       if (uIdx !== -1) {
         const removed = users.splice(uIdx, 1)[0];
@@ -9797,13 +9629,14 @@ setInterval(() => {
     }
   }
 
-  // Also sweep users array directly for any disconnected or orphaned sockets inactive > 30 mins
-  const thirtyMinsAgo = Date.now() - 30 * 60 * 1000;
+  const memberUserExpiryAgo = now - Math.max(1800, graceSeconds * 2) * 1000;
+  const guestUserExpiryAgo = now - Math.max(600, graceSeconds) * 1000;
   for (let i = users.length - 1; i >= 0; i--) {
     const u = users[i];
     const isSocketAlive = io.sockets.sockets.get(u.id)?.connected;
     const lastActive = u.lastActiveTime || u.joinedAt || 0;
-    if (!isSocketAlive && lastActive < thirtyMinsAgo) {
+    const cutoff = u.role === 'guest' ? guestUserExpiryAgo : memberUserExpiryAgo;
+    if (!isSocketAlive && lastActive < cutoff) {
       const removed = users.splice(i, 1)[0];
       if (removed.micSlot !== null) {
         const slots = getMicSlotsForRoom(removed.room);
@@ -9819,27 +9652,9 @@ setInterval(() => {
   if (changed) {
     broadcastAllUsers();
   }
-}, 60000);
+}, 60000).unref();
 
-// REST API & Health Check Endpoints
-app.get(['/health', '/api/health'], (_req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    uptime: Math.floor(process.uptime()),
-    timestamp: Date.now(),
-    onlineUsers: users.length,
-    activeRooms: chatRooms.length,
-    version: '1.0.0'
-  });
-});
-
-app.get('/api/stats', (_req, res) => {
-  res.json({
-    onlineUsers: users.length,
-    activeRooms: chatRooms.length,
-    totalMessages: chatHistory.length
-  });
-});
+// Health & stats REST endpoints are registered via ./server/routes/apiRoutes.ts
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
@@ -9861,7 +9676,7 @@ async function startServer() {
 
   const isHmrDisabled = process.env.DISABLE_HMR === 'true';
 
-  if (!isProd) {
+  const setupDevVite = async () => {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -9870,11 +9685,25 @@ async function startServer() {
           ? false
           : {
               server: httpServer
-            }
+            },
+        ws: isHmrDisabled ? false : undefined
       },
       appType: 'spa'
     });
     app.use(vite.middlewares);
+  };
+
+  const warmupData = async () => {
+    try {
+      await dataManager.whenReady(2000);
+      console.log(`📦 Data storage ready (isCloudConnected: ${dataManager.isCloudConnected()})`);
+    } catch (err) {
+      console.warn('⚠️ Data storage warmup warning (proceeding with best effort):', err);
+    }
+  };
+
+  if (!isProd) {
+    await Promise.all([setupDevVite(), warmupData()]);
   } else {
     const distPath = path.join(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
@@ -9899,30 +9728,11 @@ async function startServer() {
         res.setHeader('Expires', '0');
         res.sendFile(path.join(distPath, 'index.html'));
       });
+      await warmupData();
     } else {
       console.warn('⚠️ [Production Warning] dist/ folder not found. Falling back to dynamic Vite dev server so the app runs smoothly!');
-      const { createServer: createViteServer } = await import('vite');
-      const vite = await createViteServer({
-        server: {
-          middlewareMode: true,
-          hmr: isHmrDisabled
-            ? false
-            : {
-                server: httpServer
-              }
-        },
-        appType: 'spa'
-      });
-      app.use(vite.middlewares);
+      await Promise.all([setupDevVite(), warmupData()]);
     }
-  }
-
-  try {
-    // Warm up and await storage adapter hydration so initial requests receive complete data
-    await dataManager.whenReady(3000);
-    console.log(`📦 Data storage ready (isCloudConnected: ${dataManager.isCloudConnected()})`);
-  } catch (err) {
-    console.warn('⚠️ Data storage warmup warning (proceeding with best effort):', err);
   }
 
   httpServer.on('error', (err: any) => {

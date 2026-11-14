@@ -2570,7 +2570,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                 <input
                   type="number"
                   min={5}
-                  max={600}
+                  max={3600}
                   value={timeoutForm.offlineGraceSeconds}
                   onChange={(e) => setTimeoutForm({ ...timeoutForm, offlineGraceSeconds: Math.max(5, parseInt(e.target.value, 10) || 45) })}
                   className="w-full p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-amber-300 font-mono font-bold text-xs outline-none focus:border-amber-500"
@@ -2585,7 +2585,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                 <input
                   type="number"
                   min={5}
-                  max={300}
+                  max={900}
                   value={timeoutForm.micGraceSeconds}
                   onChange={(e) => setTimeoutForm({ ...timeoutForm, micGraceSeconds: Math.max(5, parseInt(e.target.value, 10) || 45) })}
                   className="w-full p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-amber-300 font-mono font-bold text-xs outline-none focus:border-amber-500"
@@ -2600,7 +2600,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                 <input
                   type="number"
                   min={10}
-                  max={900}
+                  max={3600}
                   value={timeoutForm.awayDelaySeconds}
                   onChange={(e) => setTimeoutForm({ ...timeoutForm, awayDelaySeconds: Math.max(10, parseInt(e.target.value, 10) || 120) })}
                   className="w-full p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-amber-300 font-mono font-bold text-xs outline-none focus:border-amber-500"
@@ -2615,7 +2615,7 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                 <input
                   type="number"
                   min={1}
-                  max={30}
+                  max={120}
                   value={timeoutForm.reconnectBannerDelaySeconds}
                   onChange={(e) => setTimeoutForm({ ...timeoutForm, reconnectBannerDelaySeconds: Math.max(1, parseInt(e.target.value, 10) || 4) })}
                   className="w-full p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-amber-300 font-mono font-bold text-xs outline-none focus:border-amber-500"

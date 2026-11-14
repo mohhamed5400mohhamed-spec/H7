@@ -20,7 +20,10 @@ export class SocketFloodGuard {
     private cooldownPenaltyMs: number = 4000
   ) {
     // Auto-prune stale buckets every 5 minutes
-    setInterval(() => this.cleanup(), 5 * 60 * 1000);
+    const timer = setInterval(() => this.cleanup(), 5 * 60 * 1000);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
   }
 
   /**

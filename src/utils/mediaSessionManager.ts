@@ -116,8 +116,14 @@ class UnifiedMediaSessionManager {
         if (state === 'interrupted') {
           this.handleExternalInterruption('audioctx-interrupted');
         } else if (state === 'suspended') {
-          // On Android Chrome / iOS, phone calls or external exclusive media suspend the active AudioContext
-          if (this.activeMedia && this.activeMedia.isPlaying && !this.isInCallMode) {
+          // On Android Chrome / iOS, OS power-saving suspends AudioContext in background even when <audio> keeps playing.
+          // Never treat background AudioContext suspension as a phone call interruption for keepalive.
+          if (
+            this.activeMedia &&
+            this.activeMedia.isPlaying &&
+            this.activeMedia.kind !== 'keepalive' &&
+            !this.isInCallMode
+          ) {
             this.handleExternalInterruption('audioctx-suspended');
           }
         } else if (state === 'running') {
@@ -285,8 +291,14 @@ class UnifiedMediaSessionManager {
     if (!this.activeMedia || this.activeMedia.id !== id) return;
     if (this.isInCallMode) return;
 
-    // Check if AudioContext indicates an OS-level interruption / focus loss
     const ctxState = this.getAudioContextState();
+    if (this.activeMedia.kind === 'keepalive') {
+      if (ctxState === 'interrupted') {
+        this.handleExternalInterruption('element-pause');
+      }
+      return;
+    }
+
     const isLikelyExternalFocusLoss =
       ctxState === 'interrupted' ||
       ctxState === 'suspended' ||

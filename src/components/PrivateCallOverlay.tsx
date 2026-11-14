@@ -18,7 +18,7 @@ import {
   X
 } from 'lucide-react';
 import { DEFAULT_AVATAR_SVG } from '../utils/avatarConstants';
-import { ICE_SERVERS } from '../utils/audioMesh';
+import { ICE_SERVERS, getDynamicIceConfiguration } from '../utils/audioMesh';
 
 export interface CallPartner {
   id: string;
@@ -76,6 +76,9 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
   const offerSentRef = useRef(false);
   const ringtoneAudioRef = useRef<AudioContext | null>(null);
   const ringtoneIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const iceRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const iceRestartAttemptsRef = useRef<number>(0);
+  const autoplayUnlockCleanupRef = useRef<(() => void) | null>(null);
 
   // Sync speaker mute to remote media elements
   useEffect(() => {
@@ -145,6 +148,15 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
   const cleanupPeerAndMedia = () => {
     offerSentRef.current = false;
     pendingIceCandidatesRef.current = [];
+    iceRestartAttemptsRef.current = 0;
+    if (iceRetryTimerRef.current) {
+      clearTimeout(iceRetryTimerRef.current);
+      iceRetryTimerRef.current = null;
+    }
+    if (autoplayUnlockCleanupRef.current) {
+      autoplayUnlockCleanupRef.current();
+      autoplayUnlockCleanupRef.current = null;
+    }
     setHasRemoteVideo(false);
     setMediaError(null);
     if (pcRef.current) {
@@ -233,7 +245,13 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
           }
         }
 
-        const pc = new RTCPeerConnection(ICE_SERVERS);
+        const rtcConfig = await getDynamicIceConfiguration().catch(() => ICE_SERVERS);
+        if (cancelled) {
+          stream?.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        const pc = new RTCPeerConnection(rtcConfig || ICE_SERVERS);
         pcRef.current = pc;
 
         if (stream) {
@@ -250,6 +268,23 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
 
         const remoteStream = new MediaStream();
         remoteStreamRef.current = remoteStream;
+
+        const attachAutoplayUnlock = () => {
+          if (autoplayUnlockCleanupRef.current) return;
+          const unlock = () => {
+            remoteAudioRef.current?.play().catch(() => {});
+            remoteVideoRef.current?.play().catch(() => {});
+            document.removeEventListener('pointerdown', unlock);
+            document.removeEventListener('touchstart', unlock);
+            autoplayUnlockCleanupRef.current = null;
+          };
+          document.addEventListener('pointerdown', unlock, { once: true });
+          document.addEventListener('touchstart', unlock, { once: true });
+          autoplayUnlockCleanupRef.current = () => {
+            document.removeEventListener('pointerdown', unlock);
+            document.removeEventListener('touchstart', unlock);
+          };
+        };
 
         pc.ontrack = (event) => {
           const incomingStream = event.streams?.[0];
@@ -268,13 +303,13 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
             if (remoteVideoRef.current) {
               remoteVideoRef.current.srcObject = remoteStream;
               remoteVideoRef.current.muted = isSpeakerMuted;
-              remoteVideoRef.current.play().catch(() => {});
+              remoteVideoRef.current.play().catch(attachAutoplayUnlock);
             }
           }
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = remoteStream;
             remoteAudioRef.current.muted = isSpeakerMuted;
-            remoteAudioRef.current.play().catch(() => {});
+            remoteAudioRef.current.play().catch(attachAutoplayUnlock);
           }
           setCallStatus('connected');
         };
@@ -292,10 +327,57 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
           }
         };
 
+        const attemptPrivateCallIceRestart = async () => {
+          if (cancelled || !pcRef.current) return;
+          if (iceRestartAttemptsRef.current >= 3) return;
+          iceRestartAttemptsRef.current += 1;
+          try {
+            if (typeof pc.restartIce === 'function') {
+              pc.restartIce();
+            }
+            if (activeCall.isInitiator && socket) {
+              setCallStatus('connecting');
+              const offer = await pc.createOffer({ iceRestart: true });
+              await pc.setLocalDescription(offer);
+              socket.emit('pmCallSignal', {
+                toId: activeCall.partner.id,
+                data: {
+                  callId: activeCall.callId,
+                  type: 'offer',
+                  sdp: pc.localDescription
+                }
+              });
+            }
+          } catch (err) {
+            console.warn('Private call ICE restart notice:', err);
+          }
+        };
+
         pc.oniceconnectionstatechange = () => {
           const state = pc.iceConnectionState;
           if (state === 'connected' || state === 'completed') {
+            if (iceRetryTimerRef.current) {
+              clearTimeout(iceRetryTimerRef.current);
+              iceRetryTimerRef.current = null;
+            }
+            iceRestartAttemptsRef.current = 0;
             setCallStatus('connected');
+          } else if (state === 'failed') {
+            if (iceRetryTimerRef.current) {
+              clearTimeout(iceRetryTimerRef.current);
+              iceRetryTimerRef.current = null;
+            }
+            void attemptPrivateCallIceRestart();
+          } else if (state === 'disconnected') {
+            if (iceRetryTimerRef.current) {
+              clearTimeout(iceRetryTimerRef.current);
+            }
+            iceRetryTimerRef.current = setTimeout(() => {
+              iceRetryTimerRef.current = null;
+              if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                void attemptPrivateCallIceRestart();
+              }
+            }, 3500);
           }
         };
       } catch (err) {

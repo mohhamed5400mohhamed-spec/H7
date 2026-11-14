@@ -11,23 +11,12 @@ const defaultTurnServers: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  {
-    // TURN over TLS on Port 443 (HTTPS port) - Bypasses DPI & ISP VoIP blocking in UAE, Oman, Qatar, KSA, etc.
-    urls: [
-      'turns:openrelay.metered.ca:443?transport=tcp',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443'
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
+  { urls: 'stun:global.stun.twilio.com:3478' }
 ];
 
 if (customTurnUrl) {
   defaultTurnServers.unshift({
-    urls: customTurnUrl.split(','),
+    urls: customTurnUrl.split(',').map((u: string) => u.trim()).filter(Boolean),
     username: customTurnUser || undefined,
     credential: customTurnPass || undefined
   });
@@ -40,6 +29,58 @@ export const ICE_SERVERS: RTCConfiguration = {
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require'
 };
+
+let cachedDynamicIceConfig: RTCConfiguration | null = null;
+let cachedDynamicIceExpiresAt = 0;
+
+/**
+ * Fetches dynamic TURN/STUN ICE configuration from `/api/turn-credentials` with 5-minute TTL cache
+ * and seamless fallback to default STUN / custom client TURN env vars.
+ */
+export async function getDynamicIceConfiguration(): Promise<RTCConfiguration> {
+  if (typeof window === 'undefined' || typeof fetch === 'undefined') {
+    return ICE_SERVERS;
+  }
+  const now = Date.now();
+  if (cachedDynamicIceConfig && now < cachedDynamicIceExpiresAt) {
+    return cachedDynamicIceConfig;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch('/api/turn-credentials', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    if (res.ok) {
+      const payload = await res.json();
+      if (Array.isArray(payload?.iceServers) && payload.iceServers.length > 0) {
+        const merged: RTCIceServer[] = [...payload.iceServers];
+        if (customTurnUrl) {
+          merged.unshift({
+            urls: customTurnUrl.split(',').map((u: string) => u.trim()).filter(Boolean),
+            username: customTurnUser || undefined,
+            credential: customTurnPass || undefined
+          });
+        }
+        cachedDynamicIceConfig = {
+          ...ICE_SERVERS,
+          iceServers: merged
+        };
+        cachedDynamicIceExpiresAt = now + 5 * 60 * 1000;
+        return cachedDynamicIceConfig;
+      }
+    }
+  } catch {
+    // Silent fallback to ICE_SERVERS
+  }
+
+  return ICE_SERVERS;
+}
 
 /**
  * Enforces Opus codec parameters for weak internet & mobile 3G/4G/5G connections:
@@ -84,6 +125,9 @@ export class AudioMeshManager {
   public onError?: (errorMsg: string) => void;
 
   private socketListeners: Array<{ event: string; fn: (...args: any[]) => void }> = [];
+  private rtcConfig: RTCConfiguration = ICE_SERVERS;
+  private iceRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private iceRestartAttempts: Map<string, number> = new Map();
 
   constructor(socket: Socket) {
     this.socket = socket;
@@ -146,16 +190,20 @@ export class AudioMeshManager {
     if (this.isInVoice) return true;
 
     try {
-      // 1. Request microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        },
-        video: false
-      });
+      // 1. Request microphone access and dynamic ICE/TURN configuration in parallel
+      const [stream, dynamicIce] = await Promise.all([
+        navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        }),
+        getDynamicIceConfiguration().catch(() => ICE_SERVERS)
+      ]);
 
+      this.rtcConfig = dynamicIce || ICE_SERVERS;
       this.localStream = stream;
       this.isInVoice = true;
       this.isMuted = false;
@@ -217,13 +265,71 @@ export class AudioMeshManager {
   }
 
 
+  // Attach ICE restart recovery to PeerConnection for cellular switches / weak networks
+  private attachIceRestartHandler(pc: RTCPeerConnection, peerId: string, isInitiator: boolean) {
+    const clearRetryTimer = () => {
+      const existing = this.iceRetryTimers.get(peerId);
+      if (existing) {
+        clearTimeout(existing);
+        this.iceRetryTimers.delete(peerId);
+      }
+    };
+
+    const triggerIceRestart = async () => {
+      if (!this.isInVoice || !this.peers.has(peerId)) return;
+      const attempts = this.iceRestartAttempts.get(peerId) || 0;
+      if (attempts >= 3) return;
+      this.iceRestartAttempts.set(peerId, attempts + 1);
+
+      try {
+        if (typeof pc.restartIce === 'function') {
+          pc.restartIce();
+        }
+        if (isInitiator) {
+          let offer = await pc.createOffer({ iceRestart: true });
+          if (offer.sdp) {
+            offer = { type: offer.type, sdp: optimizeSdpForWeakNetworks(offer.sdp) };
+          }
+          await pc.setLocalDescription(offer);
+          this.socket.emit('voiceSignal', {
+            targetId: peerId,
+            signal: offer
+          });
+        }
+      } catch (err) {
+        console.warn('ICE restart attempt notice:', err);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      if (state === 'connected' || state === 'completed') {
+        clearRetryTimer();
+        this.iceRestartAttempts.set(peerId, 0);
+      } else if (state === 'failed') {
+        clearRetryTimer();
+        void triggerIceRestart();
+      } else if (state === 'disconnected') {
+        clearRetryTimer();
+        const timer = setTimeout(() => {
+          this.iceRetryTimers.delete(peerId);
+          if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+            void triggerIceRestart();
+          }
+        }, 3500);
+        this.iceRetryTimers.set(peerId, timer);
+      }
+    };
+  }
+
   // Initiate call to an existing peer
   private async initiateCallTo(targetId: string, username: string) {
     if (this.peers.has(targetId) || !this.localStream) return;
 
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const pc = new RTCPeerConnection(this.rtcConfig || ICE_SERVERS);
     const peer: RemoteVoicePeer = { id: targetId, username, pc };
     this.peers.set(targetId, peer);
+    this.attachIceRestartHandler(pc, targetId, true);
 
     // Add local tracks
     this.localStream.getTracks().forEach((track) => {
@@ -269,9 +375,10 @@ export class AudioMeshManager {
     let pc: RTCPeerConnection;
 
     if (!peer) {
-      pc = new RTCPeerConnection(ICE_SERVERS);
+      pc = new RTCPeerConnection(this.rtcConfig || ICE_SERVERS);
       peer = { id: senderId, username: senderUsername, pc };
       this.peers.set(senderId, peer);
+      this.attachIceRestartHandler(pc, senderId, false);
 
       if (this.localStream) {
         this.localStream.getTracks().forEach((track) => {
@@ -326,18 +433,28 @@ export class AudioMeshManager {
     }
   }
 
-  // Attach remote stream to HTMLAudioElement
+  // Attach remote stream to HTMLAudioElement with mobile autoplay unlock
   private attachRemoteTrack(peer: RemoteVoicePeer, stream: MediaStream) {
     peer.stream = stream;
     let audio = peer.audioElement;
     if (!audio) {
       audio = document.createElement('audio');
       audio.autoplay = true;
+      audio.setAttribute('playsinline', 'true');
+      audio.setAttribute('webkit-playsinline', 'true');
       audio.muted = this.isDeafened;
       peer.audioElement = audio;
     }
     audio.srcObject = stream;
-    audio.play().catch((err) => console.log('Audio autoplay retry on user interaction:', err));
+    audio.play().catch(() => {
+      const unlockAudio = () => {
+        audio?.play().catch(() => {});
+        document.removeEventListener('pointerdown', unlockAudio);
+        document.removeEventListener('touchstart', unlockAudio);
+      };
+      document.addEventListener('pointerdown', unlockAudio, { once: true });
+      document.addEventListener('touchstart', unlockAudio, { once: true });
+    });
     this.notifyPeers();
   }
 
@@ -433,6 +550,13 @@ export class AudioMeshManager {
 
   // Close specific peer
   private closePeer(id: string) {
+    const timer = this.iceRetryTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.iceRetryTimers.delete(id);
+    }
+    this.iceRestartAttempts.delete(id);
+
     const peer = this.peers.get(id);
     if (peer) {
       if (peer.audioElement) {
@@ -440,6 +564,7 @@ export class AudioMeshManager {
         peer.audioElement.srcObject = null;
         peer.audioElement.remove();
       }
+      peer.pc.oniceconnectionstatechange = null;
       peer.pc.close();
       this.peers.delete(id);
       this.notifyPeers();
@@ -450,6 +575,10 @@ export class AudioMeshManager {
   public leaveVoice() {
     if (!this.isInVoice) return;
     this.isInVoice = false;
+
+    this.iceRetryTimers.forEach((timer) => clearTimeout(timer));
+    this.iceRetryTimers.clear();
+    this.iceRestartAttempts.clear();
 
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
@@ -479,6 +608,7 @@ export class AudioMeshManager {
         peer.audioElement.srcObject = null;
         peer.audioElement.remove();
       }
+      peer.pc.oniceconnectionstatechange = null;
       peer.pc.close();
     });
     this.peers.clear();

@@ -85,6 +85,12 @@ function getOrCreateSilentWavBlobUrl(): string {
     view.setUint8(36, 0x64); view.setUint8(37, 0x61); view.setUint8(38, 0x74); view.setUint8(39, 0x61);
     view.setUint32(40, dataSize, true);
 
+    // Fill with ultra-quiet 1-LSB sub-audible dither (-90dB PCM * 0.02 volume = -124dB)
+    // so iOS/Android OS media decoders keep the background tab & WebSocket alive instead of optimizing away all-zero silence.
+    for (let i = 0; i < totalSamples; i++) {
+      view.setInt16(44 + i * 2, i % 2 === 0 ? 1 : -1, true);
+    }
+
     const blob = new Blob([buffer], { type: 'audio/wav' });
     cachedSilentBlobUrl = URL.createObjectURL(blob);
     return cachedSilentBlobUrl;
@@ -153,7 +159,7 @@ function ensureSilentWavElementStarted(): void {
   if (!silentAudioEl) {
     silentAudioEl = new Audio(blobUrl);
     silentAudioEl.loop = true;
-    silentAudioEl.volume = 0.01;
+    silentAudioEl.volume = 0.02;
     (silentAudioEl as any).playsInline = true;
     silentAudioEl.setAttribute('playsinline', 'true');
     silentAudioEl.setAttribute('webkit-playsinline', 'true');
@@ -206,6 +212,22 @@ function ensureSilentWavElementStarted(): void {
 function playUnderlyingKeepAliveElements(): void {
   ensureHiddenMediaStreamStarted();
   ensureSilentWavElementStarted();
+}
+
+/**
+ * Must be called synchronously inside a user gesture (e.g. Login click/submit or first tap)
+ * so mobile Safari / Chrome authorize background audio playback before the user locks the screen.
+ */
+export function unlockBackgroundKeepAliveAudio(): void {
+  try {
+    isKeepAliveActive = true;
+    isManuallyPaused = false;
+    const ctx = mediaSessionManager.ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+    playUnderlyingKeepAliveElements();
+  } catch {}
 }
 
 function pauseUnderlyingKeepAliveElements(): void {
@@ -432,7 +454,7 @@ export function startHeartbeatWorker(socket: Socket): void {
           timer = setInterval(function() {
             tickCount++;
             self.postMessage('tick');
-            if (tickCount % 3 === 0) {
+            if (tickCount % 2 === 0) {
               try {
                 fetch(keepAliveUrl, { cache: 'no-store', keepalive: true }).catch(function(){});
               } catch(e){}
@@ -453,23 +475,22 @@ export function startHeartbeatWorker(socket: Socket): void {
     const now = Date.now();
     const tickGap = now - lastTickAt;
     lastTickAt = now;
+    const isHidden = typeof document !== 'undefined' && document.hidden;
 
     if (activeSocket.connected) {
       activeSocket.emit('keepAlivePing', { timestamp: now });
 
-      // If the OS suspended timers in background (tickGap > 12s), do NOT force-disconnect on wake.
-      // Instead, send a live ping probe and give the existing socket 6 seconds to reply.
-      if (tickGap > 12000) {
-        if (now - lastServerActivityAt > 15000 && zombieProbeSentAt === 0) {
-          zombieProbeSentAt = now;
-        }
-      } else if (now - lastServerActivityAt > 35000) {
+      // Never forcibly disconnect a socket while in background or immediately after OS timer throttling.
+      // Only recover a truly wedged foreground socket after 90s of total silence + 15s unanswered probe.
+      if (isHidden || tickGap > 15000) {
+        zombieProbeSentAt = 0;
+      } else if (now - lastServerActivityAt > 90000) {
         if (zombieProbeSentAt === 0) {
           zombieProbeSentAt = now;
         } else if (
-          now - zombieProbeSentAt > 6000 &&
+          now - zombieProbeSentAt > 15000 &&
           lastServerActivityAt < zombieProbeSentAt &&
-          now - lastZombieReconnectAt > 15000 &&
+          now - lastZombieReconnectAt > 30000 &&
           (typeof navigator === 'undefined' || navigator.onLine !== false)
         ) {
           lastZombieReconnectAt = now;
@@ -486,12 +507,18 @@ export function startHeartbeatWorker(socket: Socket): void {
       }
     }
 
-    // Maintain background MediaStream if keep-alive is enabled and not manually paused or interrupted
+    // Also keep Service Worker registration warm in background
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
+      try {
+        navigator.serviceWorker.controller.postMessage({ type: 'KEEP_ALIVE_PING', ts: now });
+      } catch {}
+    }
+
+    // Maintain background MediaStream/WAV even if OS suspended WebAudio AudioContext
     if (
       isKeepAliveActive &&
       !isManuallyPaused &&
       mediaSessionManager.getActiveMediaKind() === 'keepalive' &&
-      mediaSessionManager.getAudioContextState() === 'running' &&
       !isKeepAliveAudioPlaying()
     ) {
       playUnderlyingKeepAliveElements();
@@ -499,8 +526,7 @@ export function startHeartbeatWorker(socket: Socket): void {
 
     // Check background elapsed time for presence dot transition (green -> yellow)
     if (
-      typeof document !== 'undefined' &&
-      document.hidden &&
+      isHidden &&
       backgroundStartTime !== null &&
       !hasEmittedAway
     ) {
@@ -590,24 +616,21 @@ export function setupVisibilityResync(
     if (activeSocket) {
       const wasDisconnected = !activeSocket.connected || hadDisconnectInBg;
       hadDisconnectInBg = false;
+      const nowTs = Date.now();
+      lastTickAt = nowTs;
+      zombieProbeSentAt = 0;
 
       if (!activeSocket.connected) {
         if (activeSocket.disconnected) {
           activeSocket.connect();
         }
       } else {
-        const nowTs = Date.now();
-        lastTickAt = nowTs;
-        if (nowTs - lastServerActivityAt > 15000 && zombieProbeSentAt === 0) {
-          zombieProbeSentAt = nowTs;
-        }
         activeSocket.emit('keepAlivePing', { timestamp: nowTs });
         activeSocket.emit('userPresenceChange', { state: 'online' });
       }
 
-      const now = Date.now();
-      if (onWake && now - lastWakeSyncAt > 2500) {
-        lastWakeSyncAt = now;
+      if (onWake && nowTs - lastWakeSyncAt > 2500) {
+        lastWakeSyncAt = nowTs;
         onWake(wasDisconnected, elapsedBgSeconds);
       }
     }

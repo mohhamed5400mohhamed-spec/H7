@@ -327,10 +327,121 @@ export class CloudRemoteDataDriver implements IDataDriver {
   }
 }
 
+export const MONGO_CHUNK_THRESHOLD_BYTES = 3_500_000; // ~3.5MB safe ceiling per MongoDB document
+export const MONGO_CHUNK_SUFFIX = '__chunk_';
+
+export interface ChunkedManifest {
+  __chunked: true;
+  kind: 'array' | 'object' | 'json';
+  chunkCount: number;
+}
+
+/**
+ * Pure helper: splits a large array or plain object into chunks each smaller than `maxBytesPerChunk`
+ * when JSON-serialized, returning null if payload is already safely below threshold.
+ */
+export function splitPayloadIntoChunks(
+  data: any,
+  maxBytesPerChunk: number = MONGO_CHUNK_THRESHOLD_BYTES
+): { kind: 'array' | 'object' | 'json'; chunks: any[] } | null {
+  let totalBytes = 0;
+  try {
+    totalBytes = Buffer.byteLength(JSON.stringify(data), 'utf8');
+  } catch {
+    return null;
+  }
+
+  if (totalBytes <= maxBytesPerChunk) {
+    return null;
+  }
+
+  if (Array.isArray(data)) {
+    const chunks: any[][] = [];
+    let current: any[] = [];
+    let currentBytes = 2; // '[]'
+
+    for (const item of data) {
+      const itemJson = JSON.stringify(item);
+      const itemBytes = Buffer.byteLength(itemJson, 'utf8') + 1;
+      if (current.length > 0 && currentBytes + itemBytes > maxBytesPerChunk) {
+        chunks.push(current);
+        current = [item];
+        currentBytes = 2 + itemBytes;
+      } else {
+        current.push(item);
+        currentBytes += itemBytes;
+      }
+    }
+    if (current.length > 0) chunks.push(current);
+    return { kind: 'array', chunks };
+  }
+
+  if (data && typeof data === 'object') {
+    const entries = Object.entries(data);
+    const chunks: Array<Record<string, any>> = [];
+    let current: Record<string, any> = {};
+    let currentBytes = 2; // '{}'
+    let currentCount = 0;
+
+    for (const [k, v] of entries) {
+      const entryBytes = Buffer.byteLength(JSON.stringify({ [k]: v }), 'utf8');
+      if (currentCount > 0 && currentBytes + entryBytes > maxBytesPerChunk) {
+        chunks.push(current);
+        current = { [k]: v };
+        currentBytes = 2 + entryBytes;
+        currentCount = 1;
+      } else {
+        current[k] = v;
+        currentBytes += entryBytes;
+        currentCount += 1;
+      }
+    }
+    if (currentCount > 0) chunks.push(current);
+    return { kind: 'object', chunks };
+  }
+
+  // Fallback for huge primitive strings: slice serialized JSON string
+  const serialized = JSON.stringify(data);
+  const strChunks: string[] = [];
+  const sliceLen = Math.max(1024, Math.floor(maxBytesPerChunk / 2));
+  for (let i = 0; i < serialized.length; i += sliceLen) {
+    strChunks.push(serialized.slice(i, i + sliceLen));
+  }
+  return { kind: 'json', chunks: strChunks };
+}
+
+/**
+ * Pure helper: reassembles chunks according to manifest kind.
+ */
+export function reassemblePayloadFromChunks(manifest: ChunkedManifest, chunks: any[]): any {
+  if (manifest.kind === 'array') {
+    const merged: any[] = [];
+    for (const chunk of chunks) {
+      if (Array.isArray(chunk)) {
+        merged.push(...chunk);
+      }
+    }
+    return merged;
+  }
+
+  if (manifest.kind === 'object') {
+    const merged: Record<string, any> = {};
+    for (const chunk of chunks) {
+      if (chunk && typeof chunk === 'object' && !Array.isArray(chunk)) {
+        Object.assign(merged, chunk);
+      }
+    }
+    return merged;
+  }
+
+  // kind === 'json'
+  return JSON.parse(chunks.join(''));
+}
+
 /**
  * Native MongoDB Driver
  * Connects directly to MongoDB (MongoDB Atlas, Railway MongoDB, or local MongoDB instance).
- * Uses robust connection pooling, automatic failover, and local cache sync for maximum reliability.
+ * Uses robust connection pooling, automatic >3.5MB chunking, failover, and local cache sync.
  */
 export class MongoDbDataDriver implements IDataDriver {
   name: DatabaseDriverType = 'mongodb';
@@ -385,6 +496,88 @@ export class MongoDbDataDriver implements IDataDriver {
     this.hydrationListeners.push(cb);
   }
 
+  private async writeCollectionToMongo(collection: string, data: any): Promise<void> {
+    if (!this.isConnected || !this.db) return;
+    const col = this.db.collection('app_collections');
+    const split = splitPayloadIntoChunks(data, MONGO_CHUNK_THRESHOLD_BYTES);
+
+    if (!split) {
+      await col.updateOne(
+        { _id: collection as any },
+        { $set: { data, updatedAt: new Date() }, $unset: { __chunked: '', kind: '', chunkCount: '' } },
+        { upsert: true }
+      );
+      await col.deleteMany({ _id: { $regex: `^${collection.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${MONGO_CHUNK_SUFFIX}` } as any });
+      return;
+    }
+
+    // Persist each chunk document first
+    for (let i = 0; i < split.chunks.length; i++) {
+      const chunkId = `${collection}${MONGO_CHUNK_SUFFIX}${i}`;
+      await col.updateOne(
+        { _id: chunkId as any },
+        { $set: { data: split.chunks[i], parentCollection: collection, chunkIndex: i, updatedAt: new Date() } },
+        { upsert: true }
+      );
+    }
+
+    // Update manifest on the root document
+    await col.updateOne(
+      { _id: collection as any },
+      {
+        $set: {
+          __chunked: true,
+          kind: split.kind,
+          chunkCount: split.chunks.length,
+          updatedAt: new Date()
+        },
+        $unset: { data: '' }
+      },
+      { upsert: true }
+    );
+
+    // Prune any obsolete tail chunks from when the collection was larger
+    const staleChunkIds = [];
+    for (let i = split.chunks.length; i < split.chunks.length + 50; i++) {
+      staleChunkIds.push(`${collection}${MONGO_CHUNK_SUFFIX}${i}`);
+    }
+    await col.deleteMany({
+      _id: {
+        $regex: `^${collection.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${MONGO_CHUNK_SUFFIX}`
+      } as any,
+      chunkIndex: { $gte: split.chunks.length }
+    });
+  }
+
+  private async readCollectionFromMongo(collection: string): Promise<{ found: boolean; data?: any }> {
+    if (!this.isConnected || !this.db) return { found: false };
+    const col = this.db.collection('app_collections');
+    const doc = (await col.findOne({ _id: collection as any })) as any;
+    if (!doc) return { found: false };
+
+    if (doc.__chunked) {
+      const chunkIds = Array.from({ length: Number(doc.chunkCount || 0) }, (_, idx) => `${collection}${MONGO_CHUNK_SUFFIX}${idx}`);
+      const chunkDocs = await col
+        .find({ _id: { $in: chunkIds } as any })
+        .sort({ chunkIndex: 1 })
+        .toArray();
+      const chunkMap = new Map<string, any>(chunkDocs.map((c: any) => [String(c._id), c.data]));
+      const orderedChunks = chunkIds.map((id) => chunkMap.get(id));
+      return {
+        found: true,
+        data: reassemblePayloadFromChunks(
+          { __chunked: true, kind: doc.kind || 'array', chunkCount: chunkIds.length },
+          orderedChunks
+        )
+      };
+    }
+
+    if (doc.data !== undefined) {
+      return { found: true, data: doc.data };
+    }
+    return { found: false };
+  }
+
   async flush(): Promise<void> {
     const promises: Promise<any>[] = [];
     for (const [collection, timer] of this.pendingSaves.entries()) {
@@ -392,13 +585,10 @@ export class MongoDbDataDriver implements IDataDriver {
       this.pendingSaves.delete(collection);
       if (this.isConnected && this.db && this.memoryCache.has(collection)) {
         const data = this.memoryCache.get(collection);
-        const col = this.db.collection('app_collections');
         promises.push(
-          col.updateOne(
-            { _id: collection as any },
-            { $set: { data, updatedAt: new Date() } },
-            { upsert: true }
-          ).catch((err) => console.error(`[Data Layer - MongoDB] Error flushing "${collection}":`, err))
+          this.writeCollectionToMongo(collection, data).catch((err) =>
+            console.error(`[Data Layer - MongoDB] Error flushing "${collection}":`, err)
+          )
         );
       }
     }
@@ -434,6 +624,9 @@ export class MongoDbDataDriver implements IDataDriver {
           this.reconnectTimer = null;
           this.initConnection();
         }, 15000);
+        if (typeof this.reconnectTimer.unref === 'function') {
+          this.reconnectTimer.unref();
+        }
       }
     }
   }
@@ -442,15 +635,40 @@ export class MongoDbDataDriver implements IDataDriver {
     if (!this.db) return;
     try {
       const col = this.db.collection('app_collections');
-      const docs = await col.find({}).toArray();
+      const docs = (await col.find({}).toArray()) as any[];
+      const chunkMap = new Map<string, any>();
+      const chunkedManifests: Array<{ key: string; manifest: ChunkedManifest }> = [];
       let count = 0;
+
       for (const doc of docs) {
-        if (doc && doc._id && doc.data !== undefined) {
-          const key = String(doc._id);
+        if (!doc || !doc._id) continue;
+        const key = String(doc._id);
+        if (key.includes(MONGO_CHUNK_SUFFIX)) {
+          chunkMap.set(key, doc.data);
+          continue;
+        }
+        if (doc.__chunked) {
+          chunkedManifests.push({
+            key,
+            manifest: { __chunked: true, kind: doc.kind || 'array', chunkCount: Number(doc.chunkCount || 0) }
+          });
+          continue;
+        }
+        if (doc.data !== undefined) {
           this.memoryCache.set(key, doc.data);
           count++;
         }
       }
+
+      for (const { key, manifest } of chunkedManifests) {
+        const chunks: any[] = [];
+        for (let i = 0; i < manifest.chunkCount; i++) {
+          chunks.push(chunkMap.get(`${key}${MONGO_CHUNK_SUFFIX}${i}`));
+        }
+        this.memoryCache.set(key, reassemblePayloadFromChunks(manifest, chunks));
+        count++;
+      }
+
       this.isHydrated = true;
       if (this.readyResolve) {
         this.readyResolve(true);
@@ -492,11 +710,10 @@ export class MongoDbDataDriver implements IDataDriver {
     }
     if (this.isConnected && this.db) {
       try {
-        const col = this.db.collection('app_collections');
-        const doc = await col.findOne({ _id: collection as any });
-        if (doc && doc.data !== undefined) {
-          this.memoryCache.set(collection, doc.data);
-          return doc.data as T;
+        const res = await this.readCollectionFromMongo(collection);
+        if (res.found) {
+          this.memoryCache.set(collection, res.data);
+          return res.data as T;
         }
       } catch (err) {
         console.warn(`[Data Layer - MongoDB] Error querying "${collection}", using fallback:`, err);
@@ -510,7 +727,7 @@ export class MongoDbDataDriver implements IDataDriver {
     // 1. Instantly update active memory cache
     this.memoryCache.set(collection, data);
 
-    // 2. If MongoDB is connected, save directly and exclusively to MongoDB
+    // 2. If MongoDB is connected, save directly and exclusively to MongoDB (with >3.5MB auto-chunking)
     if (this.isConnected && this.db) {
       if (this.pendingSaves.has(collection)) {
         clearTimeout(this.pendingSaves.get(collection)!);
@@ -520,19 +737,12 @@ export class MongoDbDataDriver implements IDataDriver {
         this.pendingSaves.delete(collection);
         if (this.isConnected && this.db) {
           try {
-            const col = this.db.collection('app_collections');
-            await col.updateOne(
-              { _id: collection as any },
-              { $set: { data, updatedAt: new Date() } },
-              { upsert: true }
-            );
+            await this.writeCollectionToMongo(collection, data);
           } catch (err: any) {
             console.error(`[Data Layer - MongoDB] Failed to write collection "${collection}" to MongoDB, falling back to local replica:`, err.message || err);
-            // Fall back to local storage only if MongoDB write failed
             await this.localFallback.save(collection, data);
           }
         } else {
-          // If MongoDB disconnected in the interim, fall back to local
           await this.localFallback.save(collection, data);
         }
       }, 300);
@@ -552,6 +762,9 @@ export class MongoDbDataDriver implements IDataDriver {
       try {
         const col = this.db.collection('app_collections');
         await col.deleteOne({ _id: collection as any });
+        await col.deleteMany({
+          _id: { $regex: `^${collection.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${MONGO_CHUNK_SUFFIX}` } as any
+        });
       } catch (err) {
         console.error(`[Data Layer - MongoDB] Failed to delete collection "${collection}":`, err);
       }
