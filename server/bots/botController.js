@@ -105,6 +105,7 @@ export function registerBotSocketHandlers(socket, hostContext) {
     const roamMode = payload.roamMode === 'selected' ? 'selected' : 'random';
     const roamRooms = Array.isArray(payload.roamRooms) ? payload.roamRooms.map(String) : [];
     const roamIntervalMinutes = Math.max(0.1, Number(payload.roamIntervalMinutes) || 5);
+    const chosenFlag = hostContext.sanitizeText(String(payload.flag || '')).trim() || '🇸🇦';
 
     if (!cleanName || !cleanQuote || !status || !defaultRoom || !personality || !avatarUrl) {
       const err = 'جميع الحقول الأساسية إجبارية (الاسم، الصورة، الحالة، الحالة الكتابية، الغرفة الافتراضية، والشخصية).';
@@ -135,7 +136,7 @@ export function registerBotSocketHandlers(socket, hostContext) {
       currentRoom: defaultRoom,
       personality,
       notes,
-      flag: payload.flag || '🇸🇦',
+      flag: chosenFlag,
       enabled: payload.enabled !== false,
       roamMode,
       roamRooms,
@@ -182,6 +183,7 @@ export function registerBotSocketHandlers(socket, hostContext) {
     const defaultRoom = String(payload.defaultRoom || '').trim();
     const personality = String(payload.personality || '').trim();
     const notes = hostContext.sanitizeText(String(payload.notes ?? bot.notes ?? '')).trim();
+    const chosenFlag = hostContext.sanitizeText(String(payload.flag ?? bot.flag ?? '🇸🇦')).trim() || '🇸🇦';
     const roamMode = payload.roamMode === 'selected' ? 'selected' : 'random';
     const roamRooms = Array.isArray(payload.roamRooms) ? payload.roamRooms.map(String) : bot.roamRooms;
     const roamIntervalMinutes = Math.max(0.1, Number(payload.roamIntervalMinutes) || bot.roamIntervalMinutes || 5);
@@ -219,6 +221,7 @@ export function registerBotSocketHandlers(socket, hostContext) {
     }
     bot.personality = ['friendly', 'formal', 'funny', 'smart'].includes(personality) ? personality : bot.personality;
     bot.notes = notes;
+    bot.flag = chosenFlag;
     bot.roamMode = roamMode;
     bot.roamRooms = roamRooms;
     bot.roamIntervalMinutes = roamIntervalMinutes;

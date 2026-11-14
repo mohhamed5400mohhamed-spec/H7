@@ -86,6 +86,34 @@ const PERSONALITY_LABELS: Record<BotPersonalityOption, string> = {
   smart: 'ذكي'
 };
 
+const BOT_COUNTRY_FLAGS: Array<{ code: string; name: string; flag: string }> = [
+  { code: 'SA', name: 'المملكة العربية السعودية', flag: '🇸🇦' },
+  { code: 'YE', name: 'الجمهورية اليمنية', flag: '🇾🇪' },
+  { code: 'EG', name: 'جمهورية مصر العربية', flag: '🇪🇬' },
+  { code: 'AE', name: 'الإمارات العربية المتحدة', flag: '🇦🇪' },
+  { code: 'KW', name: 'دولة الكويت', flag: '🇰🇼' },
+  { code: 'QA', name: 'دولة قطر', flag: '🇶🇦' },
+  { code: 'BH', name: 'مملكة البحرين', flag: '🇧🇭' },
+  { code: 'OM', name: 'سلطنة عُمان', flag: '🇴🇲' },
+  { code: 'IQ', name: 'جمهورية العراق', flag: '🇮🇶' },
+  { code: 'SY', name: 'الجمهورية العربية السورية', flag: '🇸🇾' },
+  { code: 'JO', name: 'المملكة الأردنية الهاشمية', flag: '🇯🇴' },
+  { code: 'LB', name: 'الجمهورية اللبنانية', flag: '🇱🇧' },
+  { code: 'PS', name: 'دولة فلسطين', flag: '🇵🇸' },
+  { code: 'DZ', name: 'الجمهورية الجزائرية', flag: '🇩🇿' },
+  { code: 'MA', name: 'المملكة المغربية', flag: '🇲🇦' },
+  { code: 'TN', name: 'الجمهورية التونسية', flag: '🇹🇳' },
+  { code: 'LY', name: 'دولة ليبيا', flag: '🇱🇾' },
+  { code: 'SD', name: 'جمهورية السودان', flag: '🇸🇩' },
+  { code: 'MR', name: 'الجمهورية الموريتانية', flag: '🇲🇷' },
+  { code: 'TR', name: 'تركيا', flag: '🇹🇷' },
+  { code: 'GB', name: 'المملكة المتحدة', flag: '🇬🇧' },
+  { code: 'US', name: 'الولايات المتحدة الأمريكية', flag: '🇺🇸' },
+  { code: 'DE', name: 'ألمانيا', flag: '🇩🇪' },
+  { code: 'FR', name: 'فرنسا', flag: '🇫🇷' },
+  { code: 'CA', name: 'كندا', flag: '🇨🇦' }
+];
+
 export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList, showToast }) => {
   const [bots, setBots] = useState<BotRecord[]>([]);
   const [settings, setSettings] = useState<BotGlobalSettings>({
@@ -110,6 +138,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
   const [botStatusQuote, setBotStatusQuote] = useState('أهلاً بكم في شات حسان برو');
   const [botDefaultRoom, setBotDefaultRoom] = useState(roomsList[0]?.id || 'الغرفة العامة');
   const [botPersonality, setBotPersonality] = useState<BotPersonalityOption>('friendly');
+  const [botFlag, setBotFlag] = useState<string>('🇸🇦');
   const [botRoamMode, setBotRoamMode] = useState<'random' | 'selected'>('random');
   const [botRoamRooms, setBotRoamRooms] = useState<string[]>([]);
   const [botRoamMinutes, setBotRoamMinutes] = useState<number>(5);
@@ -160,9 +189,10 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
     setBotName('');
     setBotAvatarUrl(presetAvatars[0] || FALLBACK_PRESET_AVATARS[0]);
     setBotStatus('online');
-    setBotStatusQuote('أهلاً بكم في شات حسن برو');
+    setBotStatusQuote('أهلاً بكم في شات حسان برو');
     setBotDefaultRoom(roomsList[0]?.id || 'الغرفة العامة');
     setBotPersonality('friendly');
+    setBotFlag('🇸🇦');
     setBotRoamMode('random');
     setBotRoamRooms([]);
     setBotRoamMinutes(5);
@@ -178,6 +208,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
     setBotStatusQuote(bot.statusQuote || '');
     setBotDefaultRoom(bot.defaultRoom || roomsList[0]?.id || 'الغرفة العامة');
     setBotPersonality(bot.personality || 'friendly');
+    setBotFlag(bot.flag || '🇸🇦');
     setBotRoamMode(bot.roamMode === 'selected' ? 'selected' : 'random');
     setBotRoamRooms(Array.isArray(bot.roamRooms) ? bot.roamRooms : []);
     setBotRoamMinutes(bot.roamIntervalMinutes || 5);
@@ -232,6 +263,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
       statusQuote: botStatusQuote.trim(),
       defaultRoom: botDefaultRoom,
       personality: botPersonality,
+      flag: botFlag || '🇸🇦',
       roamMode: botRoamMode,
       roamRooms: botRoamRooms,
       roamIntervalMinutes: Math.max(0.1, Number(botRoamMinutes) || 5),
@@ -622,6 +654,23 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
                 <option value="smart">ذكي</option>
               </select>
             </div>
+
+            {/* Country Flag Manual Picker */}
+            <div className="sm:col-span-2">
+              <label className="block font-bold text-slate-200 text-[11px] mb-1">علم الدولة (اختيار يدوي) *</label>
+              <select
+                required
+                value={botFlag}
+                onChange={(e) => setBotFlag(e.target.value)}
+                className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-600 text-white focus:border-amber-400 outline-none"
+              >
+                {BOT_COUNTRY_FLAGS.map((country) => (
+                  <option key={country.code} value={country.flag}>
+                    {country.flag} — {country.name}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           {/* Bot Roaming Configuration */}
@@ -763,7 +812,10 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({ socket, roomsList,
                             <span className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border border-slate-900 ${st.dotClass}`} />
                           </div>
                           <div className="min-w-0">
-                            <div className="font-black text-amber-200 truncate">{bot.name}</div>
+                            <div className="font-black text-amber-200 truncate flex items-center gap-1">
+                              <span>{bot.flag || '🇸🇦'}</span>
+                              <span className="truncate">{bot.name}</span>
+                            </div>
                             <div className="text-[10px] text-slate-400 truncate max-w-[140px]">
                               {PERSONALITY_LABELS[bot.personality] || 'ودود'} • {bot.statusQuote}
                             </div>

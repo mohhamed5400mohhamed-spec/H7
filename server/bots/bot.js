@@ -6,6 +6,8 @@
  * - يدير الترحيب بالأعضاء الجدد والردود التلقائية والفهم الذكي وإعادة الدخول بعد الطرد
  */
 
+import { answerDirectBotQuestion } from './botAi.js';
+
 export const BOT_PERSONALITY_LABELS = {
   friendly: 'ودود',
   formal: 'رسمي',
@@ -63,20 +65,39 @@ export const DEFAULT_BOT_REPLIES = [
 ];
 
 /**
- * Normalizes Arabic text for accurate keyword comparison without altering display text.
+ * Normalizes Arabic text (including decorative glyphs, tashkeel, tatweel/kashida, and presentation forms)
+ * for accurate matching of shortcuts & ornate messages without altering displayed text.
  * @param {string} input
  * @returns {string}
  */
 export function normalizeArabicForMatch(input) {
   if (!input || typeof input !== 'string') return '';
-  return input
+  let normalized = input
+    .replace(/ﷲ/g, 'الله')
+    .normalize('NFKC')
     .trim()
     .toLowerCase()
-    .replace(/[\u064B-\u065F\u0670]/g, '') // strip Arabic diacritics/tashkeel
-    .replace(/[أإآ]/g, 'ا')
-    .replace(/ة/g, 'ه')
-    .replace(/ى/g, 'ي')
-    .replace(/\s+/g, ' ');
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '') // zero-width / directional chars
+    .replace(/\u0640/g, '') // Arabic tatweel / kashida (e.g. بـٌركآتًہ)
+    .replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u08D3-\u08FF\u0300-\u036F]/g, '') // tashkeel & combining marks
+    .replace(/[أإآٱٲٳٵ]/g, 'ا')
+    .replace(/[ةهۂہھۀە]/g, 'ه')
+    .replace(/[يىیئێېے]/g, 'ي')
+    .replace(/[كکګڭ]/g, 'ك')
+    .replace(/[ؤوۄۅۆۇۈۉ]/g, 'و')
+    .replace(/[پبٻ]/g, 'ب')
+    .replace(/[تٹٺ]/g, 'ت')
+    .replace(/[چج]/g, 'ج')
+    .replace(/[ڤف]/g, 'ف')
+    .replace(/[قڨ]/g, 'ق')
+    // Replace decorative symbol wrappers (stars, frames, hearts) with space so token boundaries remain intact
+    .replace(/[^\p{L}\p{N}\s،,.:;!؟?\-_"'`()[\]{}«»@+*/×÷]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Collapse exaggerated elongations (3+ identical chars -> 1) while preserving natural double letters like الله
+  normalized = normalized.replace(/(.)\1{2,}/g, '$1');
+  return normalized;
 }
 
 /**
@@ -121,7 +142,105 @@ export function findMatchingBotReply(text, repliesList) {
 }
 
 /**
- * Resolves smart replies including {اسم العضو}, {الوقت الحقيقي}, "من انت", and direct bot-name mention.
+ * Detects whether a message starts by addressing an active bot by name (e.g. "سارة قولي لي ..." or "يا سارة ...").
+ * Returns { bot, questionText, isOnlyName } or null if no bot was addressed at the beginning.
+ * @param {string} rawText
+ * @param {Array<any>} activeBotsInRoom
+ * @returns {{ bot: any, questionText: string, isOnlyName: boolean } | null}
+ */
+export function detectDirectBotAddressed(rawText, activeBotsInRoom = []) {
+  if (!rawText || typeof rawText !== 'string' || !Array.isArray(activeBotsInRoom) || activeBotsInRoom.length === 0) {
+    return null;
+  }
+
+  const trimmedRaw = rawText.trim();
+  const normFull = normalizeArabicForMatch(trimmedRaw);
+  if (!normFull) return null;
+
+  // Sort longest bot names first to prevent partial prefix collisions
+  const sortedBots = [...activeBotsInRoom]
+    .filter((b) => b && b.name)
+    .sort((a, b) => normalizeArabicForMatch(b.name).length - normalizeArabicForMatch(a.name).length);
+
+  for (const bot of sortedBots) {
+    const normName = normalizeArabicForMatch(bot.name);
+    if (!normName) continue;
+
+    // Optional vocative at start: "يا " or "@"
+    let normRest = normFull;
+    if (normRest.startsWith('@')) {
+      normRest = normRest.slice(1).trim();
+    } else if (normRest.startsWith('يا ')) {
+      normRest = normRest.slice(3).trim();
+    }
+
+    if (normRest === normName) {
+      return { bot, questionText: '', isOnlyName: true };
+    }
+
+    const escapedName = normName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const startsWithNameRe = new RegExp(`^${escapedName}(?:[\\s،,.:;!؟?\\-]+)(.+)$`, 'i');
+    const matchNorm = normRest.match(startsWithNameRe);
+    if (matchNorm) {
+      // Extract clean original text after bot's name for accurate AI understanding
+      const rawTokens = trimmedRaw.replace(/^[@]+/, '').trim();
+      const rawWithoutVocative = rawTokens.replace(/^يا[\u064B-\u065F\u0670]*\s+/i, '').trim();
+      const firstTokenEnd = rawWithoutVocative.search(/[\s،,.:;!؟?\-]/);
+      const rawRemainder =
+        firstTokenEnd !== -1
+          ? rawWithoutVocative.slice(firstTokenEnd).replace(/^[\s،,.:;!؟?\-]+/, '').trim()
+          : matchNorm[1].trim();
+      const questionText = rawRemainder || matchNorm[1].trim();
+      return {
+        bot,
+        questionText,
+        isOnlyName: !questionText
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Formats a rule reply with {اسم العضو}, {الوقت الحقيقي}, {اسم البوت}, {الشخصية}.
+ * @param {any} matchedRule
+ * @param {any} actingBot
+ * @param {string} senderUsername
+ */
+function formatMatchedRuleText(matchedRule, actingBot, senderUsername) {
+  const normKw = normalizeArabicForMatch(matchedRule.keyword);
+  let replyText = String(matchedRule.reply || '');
+  const liveTimeStr = formatLiveTimeString();
+  const personalityMap = /** @type {Record<string, string>} */ (BOT_PERSONALITY_LABELS);
+  const personalityLabel =
+    personalityMap[String(actingBot.personality || '')] || actingBot.personality || 'ودود';
+
+  if (normKw === normalizeArabicForMatch('من انت')) {
+    if (replyText === 'أنا بوت شات حسن برو، هنا أساعدكم وأسليكم') {
+      replyText = `أنا ${actingBot.name} (شخصيتي: ${personalityLabel})، عضو في شات حسن برو هنا أساعدكم وأسليكم 🌹`;
+    } else {
+      replyText = replyText
+        .replace(/\{اسم البوت\}/g, actingBot.name)
+        .replace(/\{الشخصية\}/g, personalityLabel);
+      if (!replyText.includes(actingBot.name)) {
+        replyText = `أنا ${actingBot.name} (${personalityLabel}) — ${replyText}`;
+      }
+    }
+  }
+
+  return replyText
+    .replace(/\{اسم العضو\}/g, senderUsername)
+    .replace(/\{الوقت الحقيقي\}/g, liveTimeStr)
+    .replace(/\{اسم البوت\}/g, actingBot.name)
+    .replace(/\{الشخصية\}/g, personalityLabel);
+}
+
+/**
+ * Resolves smart replies including:
+ * 1. Direct addressing by bot name at the start (e.g., "سارة قولي لي ما عدد قارات العالم") -> AI/smart Q&A
+ * 2. Keyword matching from botReplies (supporting ornate Arabic & shortcuts)
+ * 3. Direct mid-sentence mention fallback
  * Returns null if nothing matches (so the bot stays silent).
  * @param {{ text: string, senderUsername: string, bot: any, activeBotsInRoom?: any[], repliesList: any[] }} params
  */
@@ -131,7 +250,46 @@ export function resolveSmartBotReply({ text, senderUsername, bot, activeBotsInRo
   const normMsg = normalizeArabicForMatch(text);
   const candidates = activeBotsInRoom.length > 0 ? activeBotsInRoom : [bot];
 
-  // Check if message mentions any active bot in room by name
+  // 1. Check if message starts with bot's name (explicitly talking/asking the bot)
+  const direct = detectDirectBotAddressed(text, candidates);
+  if (direct) {
+    if (direct.isOnlyName) {
+      return {
+        bot: direct.bot,
+        cooldownKey: `mention:${direct.bot.id}`,
+        text: `هلا فيك يا ${senderUsername}، تفضل أنا هنا! اسألني أي شيء 🌹`,
+        isAiQuestion: false
+      };
+    }
+
+    // If the remainder itself matches a short direct command in botReplies (e.g. "سارة كم الساعة" or "سارة من انت")
+    const remainderRule = findMatchingBotReply(direct.questionText, repliesList);
+    const normRemainder = normalizeArabicForMatch(direct.questionText);
+    if (remainderRule) {
+      const normKw = normalizeArabicForMatch(remainderRule.keyword);
+      const remWords = normRemainder.split(' ').filter(Boolean).length;
+      const kwWords = normKw.split(' ').filter(Boolean).length;
+      if (remWords <= kwWords + 1) {
+        return {
+          bot: direct.bot,
+          cooldownKey: `kw:${normKw}`,
+          text: formatMatchedRuleText(remainderRule, direct.bot, senderUsername),
+          isAiQuestion: false
+        };
+      }
+    }
+
+    // Otherwise treat as a genuine open question / conversation addressed to this bot
+    return {
+      bot: direct.bot,
+      cooldownKey: `ai:${direct.bot.id}:${normRemainder.slice(0, 60)}`,
+      questionText: direct.questionText,
+      text: '',
+      isAiQuestion: true
+    };
+  }
+
+  // 2. Check if message mentions any active bot in room mid-sentence
   const mentionedBot = candidates.find((candidate) => {
     const normBotName = normalizeArabicForMatch(candidate.name || '');
     return normBotName && matchesWholeKeyword(normMsg, normBotName);
@@ -142,44 +300,21 @@ export function resolveSmartBotReply({ text, senderUsername, bot, activeBotsInRo
 
   if (matchedRule) {
     const normKw = normalizeArabicForMatch(matchedRule.keyword);
-    let replyText = String(matchedRule.reply || '');
-    const liveTimeStr = formatLiveTimeString();
-    const personalityMap = /** @type {Record<string, string>} */ (BOT_PERSONALITY_LABELS);
-    const personalityLabel =
-      personalityMap[String(actingBot.personality || '')] || actingBot.personality || 'ودود';
-
-    if (normKw === normalizeArabicForMatch('من انت')) {
-      if (replyText === 'أنا بوت شات حسن برو، هنا أساعدكم وأسليكم') {
-        replyText = `أنا ${actingBot.name} (شخصيتي: ${personalityLabel})، عضو في شات حسن برو هنا أساعدكم وأسليكم 🌹`;
-      } else {
-        replyText = replyText
-          .replace(/\{اسم البوت\}/g, actingBot.name)
-          .replace(/\{الشخصية\}/g, personalityLabel);
-        if (!replyText.includes(actingBot.name)) {
-          replyText = `أنا ${actingBot.name} (${personalityLabel}) — ${replyText}`;
-        }
-      }
-    }
-
-    replyText = replyText
-      .replace(/\{اسم العضو\}/g, senderUsername)
-      .replace(/\{الوقت الحقيقي\}/g, liveTimeStr)
-      .replace(/\{اسم البوت\}/g, actingBot.name)
-      .replace(/\{الشخصية\}/g, personalityLabel);
-
     return {
       bot: actingBot,
       cooldownKey: `kw:${normKw}`,
-      text: replyText
+      text: formatMatchedRuleText(matchedRule, actingBot, senderUsername),
+      isAiQuestion: false
     };
   }
 
-  // Direct mention of bot's name even if word is not in botReplies table
+  // Direct mention of bot's name mid-sentence even if word is not in botReplies table
   if (mentionedBot) {
     return {
       bot: mentionedBot,
       cooldownKey: `mention:${mentionedBot.id}`,
-      text: `هلا فيك يا ${senderUsername}، أنا هنا`
+      text: `هلا فيك يا ${senderUsername}، أنا هنا`,
+      isAiQuestion: false
     };
   }
 
@@ -299,7 +434,8 @@ export class BotEngine {
         this.syncBotIntoRegisteredMembers(bot);
       }
 
-      this.reconcileAllBots(isRehydration);
+      // On initial boot/rehydration, hydrate bots silently without flooding old rooms
+      this.reconcileAllBots(isRehydration, { announceTransitions: false });
     } catch (err) {
       console.error('[BotEngine] Failed loading bots from storage:', err);
     }
@@ -461,10 +597,13 @@ export class BotEngine {
 
   /**
    * Synchronizes all bots into the live `users` array and refreshes per-bot timers.
+   * Emits member-style entry, leave, and transfer notices into affected rooms when bots appear, switch rooms, or leave.
    * @param {boolean} [broadcastImmediately]
+   * @param {{ announceTransitions?: boolean }} [options]
    */
-  reconcileAllBots(broadcastImmediately = true) {
+  reconcileAllBots(broadcastImmediately = true, options = {}) {
     if (!this.ctx) return;
+    const announceTransitions = options.announceTransitions !== undefined ? options.announceTransitions : true;
     const { users, chatRooms, broadcastRoomUsers, broadcastAllUsers, broadcastRoomsUpdate } = this.ctx;
     const touchedRooms = new Set();
 
@@ -480,7 +619,12 @@ export class BotEngine {
         !this.kickedBotIds.has(bot.id);
 
       if (!shouldBeLive) {
-        if (u.room) touchedRooms.add(u.room);
+        if (u.room) {
+          touchedRooms.add(u.room);
+          if (announceTransitions && !u.isGhost) {
+            this.emitBotRoomActivity(bot || { name: u.username, avatarUrl: u.avatarUrl, flag: u.flag, status: 'online' }, u.room, 'leave');
+          }
+        }
         users.splice(i, 1);
       }
     }
@@ -512,13 +656,23 @@ export class BotEngine {
       const freshUser = this.buildConnectedBotUser(bot);
 
       if (existingIdx !== -1) {
-        const prevRoom = users[existingIdx].room;
+        const prevUser = users[existingIdx];
+        const prevRoom = prevUser.room;
+        users[existingIdx] = freshUser;
         if (prevRoom && prevRoom !== freshUser.room) {
           touchedRooms.add(prevRoom);
+          if (announceTransitions && bot.status !== 'hidden') {
+            this.emitBotRoomActivity(bot, prevRoom, 'switch', freshUser.room);
+            this.emitBotRoomActivity(bot, freshUser.room, 'entry');
+          }
+        } else if (announceTransitions && prevUser.isGhost && !freshUser.isGhost) {
+          this.emitBotRoomActivity(bot, freshUser.room, 'entry');
         }
-        users[existingIdx] = freshUser;
       } else {
         users.push(freshUser);
+        if (announceTransitions && bot.status !== 'hidden') {
+          this.emitBotRoomActivity(bot, freshUser.room, 'entry');
+        }
       }
 
       touchedRooms.add(freshUser.room);
@@ -633,6 +787,14 @@ export class BotEngine {
       broadcastRoomsUpdate();
       io.emit('botsPresenceChanged', { botId: bot.id, room: nextRoom, oldRoom });
 
+      // Emit genuine room transfer / entry announcements like real members (unless hidden)
+      if (bot.status !== 'hidden') {
+        if (oldRoom) {
+          this.emitBotRoomActivity(bot, oldRoom, 'switch', nextRoom);
+        }
+        this.emitBotRoomActivity(bot, nextRoom, 'entry');
+      }
+
       // Send entry greeting in the new room if auto-replies are enabled
       if (this.settings.autoRepliesEnabled) {
         this.emitBotMessage(bot, nextRoom, 'أهلاً، وصلت، منورين 🌹');
@@ -641,6 +803,66 @@ export class BotEngine {
 
     // Schedule next independent cycle for this bot
     this.scheduleBotRoam(bot);
+  }
+
+  /**
+   * Emits a standard member-style room activity card (entry / room transfer / leave) into chat stream.
+   * Skipped when bot is in 'hidden' (ghost) status.
+   * @param {any} bot
+   * @param {string} room
+   * @param {'entry' | 'switch' | 'leave'} kind
+   * @param {string} [destinationRoom]
+   */
+  emitBotRoomActivity(bot, room, kind, destinationRoom = '') {
+    if (!this.ctx || !bot || !room) return;
+    if (bot.status === 'hidden') return;
+
+    const {
+      io,
+      chatHistory,
+      pruneRoomChatHistory,
+      saveHistory,
+      getCurrentTimeString,
+      registeredMembers
+    } = this.ctx;
+
+    const botName = String(bot.name || 'بوت');
+    const reg = registeredMembers[botName];
+
+    let badge = `${room} Room | دخل الى`;
+    let text = `دخل ${botName} إلى ${room} أهلاً وسهلاً 🦅`;
+
+    if (kind === 'switch') {
+      const dest = destinationRoom || 'غرفة أخرى';
+      badge = `${dest} | انتقل إلى`;
+      text = `غادر ${botName} وانتقل إلى غرفة [${dest}] 🚪`;
+    } else if (kind === 'leave') {
+      badge = 'مغادرة 🚪';
+      text = `غادر ${botName} الغرفة 🚪`;
+    }
+
+    const msg = {
+      id: `bot-${kind}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      room,
+      username: botName,
+      avatarUrl: bot.avatarUrl || DEFAULT_BOT_AVATARS[0],
+      nameBannerUrl: reg?.nameBannerUrl,
+      flag: bot.flag || '🇸🇦',
+      badge,
+      badgeColor: 'text-amber-400',
+      text,
+      time: getCurrentTimeString(),
+      timestamp: Date.now(),
+      nameColor: reg?.nameColor,
+      textColor: reg?.textColor,
+      nameGradient: reg?.nameGradient,
+      giftBadges: reg?.giftBadges
+    };
+
+    chatHistory.push(msg);
+    pruneRoomChatHistory(room);
+    saveHistory();
+    io.to(room).emit('message', msg);
   }
 
   /**
@@ -729,7 +951,8 @@ export class BotEngine {
   }
 
   /**
-   * Handles incoming room chat messages for keyword auto-replies and smart bot understanding.
+   * Handles incoming room chat messages for keyword auto-replies, ornate shortcuts,
+   * and direct AI-powered questions when a member prefixes their message with the bot's name.
    * @param {{ senderUser: any, text: string, room: string }} params
    */
   handleRoomChatMessage({ senderUser, text, room }) {
@@ -751,13 +974,14 @@ export class BotEngine {
       repliesList: this.replies
     });
 
-    if (!resolution) return; // Stay silent on unknown words
+    if (!resolution) return; // Stay silent on unknown words not addressed to a bot
 
     const now = Date.now();
     const cooldownKey = `${senderUser.username.trim().toLowerCase()}::${resolution.cooldownKey}`;
+    const cooldownWindowMs = resolution.isAiQuestion ? 10_000 : 60_000;
     const lastReplyAt = this.replyCooldowns.get(cooldownKey) || 0;
-    if (now - lastReplyAt < 60_000) {
-      return; // Do not reply to same user with same keyword within 1 minute
+    if (now - lastReplyAt < cooldownWindowMs) {
+      return; // Avoid duplicate spam for identical keyword/question within cooldown window
     }
     this.replyCooldowns.set(cooldownKey, now);
 
@@ -766,10 +990,9 @@ export class BotEngine {
       : 0;
 
     const targetBot = resolution.bot;
-    const replyText = resolution.text;
 
-    if (delayMs > 0) {
-      // Show subtle typing indicator during delay
+    if (delayMs > 0 || resolution.isAiQuestion) {
+      // Show subtle typing indicator while preparing/thinking
       this.ctx.io.to(room).emit('userTyping', {
         userId: this.getBotUserId(targetBot.id),
         username: targetBot.name,
@@ -781,6 +1004,62 @@ export class BotEngine {
         timestamp: Date.now()
       });
     }
+
+    if (resolution.isAiQuestion) {
+      const startedAt = Date.now();
+      answerDirectBotQuestion({
+        bot: targetBot,
+        senderUsername: senderUser.username,
+        questionText: resolution.questionText || text,
+        room
+      })
+        .then((answerText) => {
+          const elapsed = Date.now() - startedAt;
+          const remainingDelay = Math.max(0, delayMs - elapsed);
+          const sendAiReply = () => {
+            const freshBot = this.findBotById(targetBot.id);
+            this.ctx?.io?.to(room).emit('userTyping', {
+              userId: this.getBotUserId(targetBot.id),
+              username: targetBot.name,
+              room,
+              isTyping: false,
+              timestamp: Date.now()
+            });
+            if (!freshBot || !freshBot.enabled || !this.settings.botsEnabled || !this.settings.autoRepliesEnabled) {
+              return;
+            }
+            if (freshBot.currentRoom !== room || this.kickedBotIds.has(freshBot.id)) {
+              return;
+            }
+            if (answerText) {
+              this.emitBotMessage(freshBot, room, answerText);
+            }
+          };
+
+          if (remainingDelay > 0) {
+            const t = setTimeout(() => {
+              this.pendingTimers.delete(t);
+              sendAiReply();
+            }, remainingDelay);
+            if (typeof t.unref === 'function') t.unref();
+            this.pendingTimers.add(t);
+          } else {
+            sendAiReply();
+          }
+        })
+        .catch(() => {
+          this.ctx?.io?.to(room).emit('userTyping', {
+            userId: this.getBotUserId(targetBot.id),
+            username: targetBot.name,
+            room,
+            isTyping: false,
+            timestamp: Date.now()
+          });
+        });
+      return;
+    }
+
+    const replyText = resolution.text;
 
     const timer = setTimeout(() => {
       this.pendingTimers.delete(timer);
@@ -838,6 +1117,10 @@ export class BotEngine {
       users.splice(idx, 1);
     }
 
+    if (bot.status !== 'hidden') {
+      this.emitBotRoomActivity(bot, returnRoom, 'leave');
+    }
+
     broadcastRoomUsers(returnRoom);
     broadcastAllUsers(true);
     broadcastRoomsUpdate();
@@ -860,18 +1143,7 @@ export class BotEngine {
       freshBot.currentRoom = returnRoom;
       freshBot.updatedAt = Date.now();
       this.persistBots();
-      this.reconcileAllBots(true);
-
-      io.to(returnRoom).emit('message', {
-        id: `bot-rejoin-${Date.now()}`,
-        room: returnRoom,
-        username: freshBot.name,
-        avatarUrl: freshBot.avatarUrl || DEFAULT_BOT_AVATARS[0],
-        flag: freshBot.flag || '🇸🇦',
-        text: `دخل ${freshBot.name} إلى ${returnRoom} أهلاً وسهلاً 🦅`,
-        time: this.ctx.getCurrentTimeString(),
-        timestamp: Date.now()
-      });
+      this.reconcileAllBots(true, { announceTransitions: true });
     }, delayMs);
 
     if (typeof timer.unref === 'function') timer.unref();
